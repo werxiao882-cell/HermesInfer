@@ -20,7 +20,35 @@
 
 具体实现：[activation.py](src/myvllm/layers/activation.py)
 
-首先实现激活函数（如SiLU、GELU）
+首先实现激活函数。本项目使用的是 **SwiGLU** 变体——`SiluAndMul`，而非简单的 SiLU 或 GELU。
+
+**源码解析（`activation.py:6-18`）：**
+
+```python
+class SiluAndMul(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @torch.compile
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, y = x.chunk(2, -1)      # 沿最后一维对半切分
+        return F.silu(x) * y        # 前半做 SiLU，再与后半逐元素相乘
+```
+
+**为什么叫 SwiGLU？** 输入张量在最后一维被 `chunk(2, -1)` 等分为两半 `x` 和 `y`。前半部分经过 SiLU 激活（即 Swish：`x * sigmoid(x)`），然后与后半部分逐元素相乘。这正是 GLU（Gated Linear Unit）家族的 SwiGLU 变体。
+
+**数据流示意：**
+```
+输入: (batch, seq_len, 2 * intermediate_size)
+       ↓ chunk(2, -1)
+x: (batch, seq_len, intermediate_size)    y: (batch, seq_len, intermediate_size)
+       ↓ F.silu()
+silu_x: (batch, seq_len, intermediate_size)
+       ↓ 逐元素相乘
+输出: (batch, seq_len, intermediate_size)
+```
+
+**`@torch.compile` 的作用：** 装饰器会将 `chunk` → `silu` → `mul` 这三个操作融合为一个 CUDA kernel，减少显存读写和 kernel 启动开销。
 
 **关键学习: `torch.compile` 优化**
 - 基准测试:
@@ -57,6 +85,55 @@
 具体实现：[layernorm.py](src/myvllm/layers/layernorm.py)
 
 实现RMS层归一化，帮助稳定训练。
+
+**源码解析（`layernorm.py:4-34`）：**
+
+```python
+class LayerNorm(torch.nn.Module):
+    def __init__(self, gamma: torch.Tensor, eps: float = 1e-5):
+        super().__init__()
+        self.weight = torch.nn.Parameter(gamma.detach().clone())
+        self.eps = eps
+
+    @torch.compile
+    def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
+        # RMSNorm(x) = (x / sqrt(mean(x²) + ε)) ⊙ γ
+        variance = x.pow(2).mean(dim=-1, keepdim=True) + self.eps
+        sqrt_variance = variance.sqrt()
+        x_norm = (x / sqrt_variance * self.weight)
+        return x_norm
+
+    def residual_rms_forward(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        x = x + residual                    # 先加 residual
+        return self.rms_forward(x), x       # 返回 (归一化结果, 加过 residual 的原始值)
+
+    def forward(self, x, residual=None):
+        if residual is not None:
+            return self.residual_rms_forward(x, residual)
+        else:
+            return self.rms_forward(x)
+```
+
+**公式推导：**
+```
+标准 LayerNorm:  x_norm = (x - mean(x)) / sqrt(var(x) + ε) × γ + β
+RMS LayerNorm:   x_norm = x / sqrt(mean(x²) + ε) × γ
+```
+RMSNorm 省略了中心化步骤（不减均值），只保留缩放。这在大模型中效果等价但计算更快。
+
+**残差连接的双返回值设计：**
+`residual_rms_forward` 返回两个值：
+1. **归一化后的 x**：送入下一层（attention 或 MLP）
+2. **加过 residual 的原始 x**：作为下一层的 residual
+
+这实现了经典的 Pre-Norm 残差模式：
+```
+residual = x                    # 保存原始输入
+x = LayerNorm(x)               # 归一化
+x = Attention(x)               # 子层计算
+x = x + residual               # 残差连接
+# 下一轮：residual = x, 再 LayerNorm...
+```
 
 **关键知识:**
 - 对激活进行归一化，但不做均值中心化（只使用 RMS 均方根）
@@ -106,6 +183,32 @@
 
 线性层是最复杂的一层，因为需要支持分布式训练，所以需要实现张量并行。
 
+**源码架构（`linear.py`）：**
+
+```
+LinearBase (抽象基类)
+├── ReplicatedLinear      — 不做切分，每张 GPU 存完整权重
+├── ColumnParallelLinear  — 沿输出维度切分
+│   ├── MergedColumnParallelLinear  — 合并多个列并行层
+│   └── QKVColumnParallelLinear     — QKV 专用列并行
+└── RowParallelLinear     — 沿输入维度切分
+```
+
+**基类 `LinearBase`（`linear.py:6-39`）：**
+```python
+class LinearBase(nn.Module):
+    def __init__(self, input_size, output_size, bias=True, tp_dim=None):
+        super().__init__()
+        self.tp_dim = tp_dim
+        self.tp_rank = dist.get_rank()          # 当前 GPU 编号
+        self.tp_size = dist.get_world_size()    # GPU 总数
+
+        self.weight = nn.Parameter(torch.empty(output_size, input_size))
+        self.weight.weight_loader = self.weight_loader  # 绑定自定义加载器
+```
+
+**`weight_loader` 机制：** 每个参数对象上挂载了一个 `weight_loader` 方法。当从 checkpoint 加载权重时，加载器会检查参数是否有自定义 `weight_loader`，如果有就调用它来自动切分出当前 GPU 对应的分片。
+
 **核心概念：分布式模型中的权重加载**
 ```python
 # 将 checkpoint 加载到分片（sharded）模型时：
@@ -128,25 +231,123 @@ for name, param in model.named_parameters():
 
 **并行线性层的类型：**
 
-1. **ColumnParallelLinear** ✅
+1. **ColumnParallelLinear** ✅（`linear.py:84-110`）
     - 沿输出维度在多张 GPU 上切分
     - 每张 GPU 计算输出特征的一部分
     - 前向传播过程中不需要通信
 
-2. **RowParallelLinear** ✅
+    ```python
+    # 初始化：output_size 除以 tp_size
+    super().__init__(input_size, output_size // tp_size, bias, tp_dim=0)
+
+    # weight_loader：从完整权重中切出当前 GPU 的列分片
+    def weight_loader(self, param, loaded_weights):
+        shard_size = full_data_output_size // self.tp_size
+        start_index = self.tp_rank * shard_size
+        slided_weight = loaded_weights.narrow(0, start_index, shard_size)
+        param_data.copy_(slided_weight)
+
+    # forward：与普通线性层一样，无需通信
+    def forward(self, x):
+        return nn.functional.linear(x, self.weight, self.bias)
+    ```
+
+    **切分示意（2 GPU，output_size=8）：**
+    ```
+    完整权重 (8, input):  [row0, row1, row2, row3, row4, row5, row6, row7]
+    GPU 0 权重 (4, input): [row0, row1, row2, row3]
+    GPU 1 权重 (4, input): [row4, row5, row6, row7]
+    ```
+
+2. **RowParallelLinear** ✅（`linear.py:199-226`）
     - 沿输入维度在多张 GPU 上切分
     - 需要用 `dist.all_reduce` 对部分结果求和
     - 通常接在 `ColumnParallel` 层之后使用
 
-3. **MergedColumnParallelLinear** ✅
+    ```python
+    # 初始化：input_size 除以 tp_size
+    super().__init__(input_size // tp_size, output_size, bias, tp_dim=1)
+
+    # weight_loader：从完整权重中切出当前 GPU 的行分片
+    def weight_loader(self, param, loaded_weights):
+        shard_size = full_data_input_size // self.tp_size
+        start_index = self.tp_rank * shard_size
+        slided_weight = loaded_weights.narrow(1, start_index, shard_size)
+        param_data.copy_(slided_weight)
+
+    # forward：先做本地线性计算，再 all_reduce 求和
+    def forward(self, x):
+        result = nn.functional.linear(x, self.weight, self.bias)
+        if self.tp_size > 1:
+            dist.all_reduce(result, op=dist.ReduceOp.SUM)
+        return result
+    ```
+
+    **为什么 Column + Row 是标准搭配？**
+    ```
+    ColumnParallel: 输入 replicated → 输出 sharded
+    RowParallel:    输入 sharded    → 输出 replicated (after all_reduce)
+    组合:           输入 replicated → 输出 replicated
+    ```
+
+3. **MergedColumnParallelLinear** ✅（`linear.py:113-149`）
     - 将多个列并行层合并（例如 gate + up 两个投影）
-    - 必须同时对 `param_data` 和 `loaded_weight` 进行切分，以匹配对应的矩阵
+    - 必须同时对 `param_data` 和 `loaded_weights` 进行切分，以匹配对应的矩阵
     - 对 MLP 层更高效
 
-4. **QKVColumnParallel** ✅
+    ```python
+    def __init__(self, input_size, output_sizes, bias=True):
+        self.output_sizes = output_sizes  # 例如 [intermediate_size, intermediate_size]
+        super().__init__(input_size, sum(output_sizes), bias)
+
+    def weight_loader(self, param, loaded_weights, loaded_weight_id):
+        # 计算当前矩阵在合并参数中的偏移
+        offset = sum(self.output_sizes[:loaded_weight_id]) // self.tp_size
+        shard_size = self.output_sizes[loaded_weight_id] // self.tp_size
+        # 在 param_data 中找到正确位置
+        param_data = param_data.narrow(0, offset, shard_size)
+        # 从完整权重中切出当前 GPU 的分片
+        shard_weights = loaded_weights.narrow(0, self.tp_rank * shard_size, shard_size)
+        param_data.copy_(shard_weights)
+    ```
+
+    **合并示意（gate + up，2 GPU）：**
+    ```
+    合并后的参数布局 (每 GPU):
+    [gate_shard_0 | up_shard_0]   ← GPU 0
+    [gate_shard_1 | up_shard_1]   ← GPU 1
+    ```
+
+4. **QKVColumnParallel** ✅（`linear.py:152-196`）
     - Attention 中 Q/K/V 投影的特殊情况
     - 每张 GPU 存完整的 heads（不对 `head_size` 维度做切分）
     - 使每张 GPU 可以独立完成注意力计算
+
+    ```python
+    def __init__(self, input_size, head_size, num_heads, num_kv_heads=None, bias=False):
+        self.num_heads = num_heads // self.tp_size       # 每 GPU 的 Q head 数
+        self.num_kv_heads = num_kv_heads // self.tp_size  # 每 GPU 的 KV head 数
+        self.output_size = head_size * (self.num_heads + 2 * self.num_kv_heads)
+
+    def weight_loader(self, param, loaded_weights, load_weight_id):
+        # load_weight_id: 'q', 'k', 'v'
+        if load_weight_id == 'q':
+            offset = 0
+            shard_size = self.head_size * self.num_heads
+        elif load_weight_id == 'k':
+            offset = self.head_size * self.num_heads
+            shard_size = self.head_size * self.num_kv_heads
+        elif load_weight_id == 'v':
+            offset = self.head_size * self.num_heads + self.head_size * self.num_kv_heads
+            shard_size = self.head_size * self.num_kv_heads
+    ```
+
+    **GQA 布局示意（num_heads=16, num_kv_heads=8, 2 GPU）：**
+    ```
+    GPU 0: [Q_head_0..7 | KV_head_0..3 | KV_head_0..3]
+    GPU 1: [Q_head_8..15 | KV_head_4..7 | KV_head_4..7]
+    每张 GPU 独立做 attention，无需跨卡通信
+    ```
 
 **基准测试：**
 使用如下指令，进入`src/myvllm/layers`目录，在分布式环境测试运行结果是否正确
@@ -178,14 +379,67 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --nproc_per_node=4 linear.py
 - 将词表按 GPU 进行切分（分片）
 - 每张 GPU 只存储词表的一部分
 
-**LM Head：**
+**源码解析（`embedding_head.py:12-61`）：**
+
+```python
+class VocabParallelEmbedding(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim):
+        self.padded_num_embeddings = (num_embeddings + tp_size - 1) // tp_size * tp_size
+        self.num_embeddings_per_partition = self.padded_num_embeddings // tp_size
+        self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, embedding_dim))
+
+    def forward(self, x):
+        # 1. 构造 mask：哪些 token 属于当前 GPU 的词表范围
+        mask = (x >= self.tp_rank * self.num_embeddings_per_partition) & \
+               (x < (self.tp_rank + 1) * self.num_embeddings_per_partition) & \
+               (x < self.num_embeddings)
+        # 2. 将 token id 转换为本地偏移
+        x = mask * (x - self.tp_rank * self.num_embeddings_per_partition)
+        output = F.embedding(x, self.weight)
+        # 3. 对不属于本 GPU 的 token，将 embedding 置零
+        output = mask.unsqueeze(1) * output
+        # 4. all_reduce 求和：每张 GPU 只对自己的 token 有非零 embedding
+        dist.all_reduce(output, op=dist.ReduceOp.SUM)
+```
+
+**词表切分示意（vocab_size=10000, 2 GPU）：**
+```
+GPU 0: 词表 [0, 5000)     → weight shape: (5000, hidden_size)
+GPU 1: 词表 [5000, 10000)  → weight shape: (5000, hidden_size)
+
+token_id=3000 → GPU 0 有值, GPU 1 mask=0 → all_reduce 后得到正确 embedding
+token_id=7000 → GPU 0 mask=0, GPU 1 有值 → all_reduce 后得到正确 embedding
+```
+
+**LM Head（`embedding_head.py:64-93`）：**
 - 可以与词表嵌入共享权重（tied embeddings，权重绑定）
 - `F.linear` 会自动对权重做转置以完成线性计算
 - 最终 logits 可使用 `dist.gather` 或 `dist.all_gather` 汇总
 
+```python
+class ParallelLMHead(VocabParallelEmbedding):
+    def forward(self, x):
+        context = get_context()
+        if context.is_prefill:
+            # prefill 时只取每个序列的最后一个 token 计算 logits
+            last_token = context.cu_seqlens_q[1:] - 1
+            x = x[last_token].contiguous()
+
+        logits = F.linear(x, self.weight)  # (batch, vocab_per_partition)
+        if self.tp_size > 1:
+            # 只在 rank 0 收集全部 logits
+            all_logits = [torch.empty(...) for _ in range(tp_size)] if tp_rank == 0 else None
+            dist.gather(logits, gather_list=all_logits, dst=0)
+            if tp_rank == 0:
+                logits = torch.cat(all_logits, dim=-1)
+                logits = logits[..., :self.num_embeddings]  # 去掉 padding
+```
+
 **关键区别（Key Differences）：**
 - `dist.gather(tensor, gather_list, dst)`：只有 `dst` 这张 GPU 会收到全部数据
 - `dist.all_gather(tensor_list, tensor)`：所有 GPU 都会收到全部数据（没有 `dst` 参数）
+
+**为什么 LM Head 用 `gather` 而不是 `all_gather`？** 因为只有 rank 0 需要做采样（sampling），其他 GPU 不需要完整 logits。使用 `gather` 可以节省显存和通信带宽。
 
 **内存布局（Memory Layout）- contiguous()：**
 ```python
@@ -205,6 +459,58 @@ y = x.reshape(2, 3).T   # 逻辑视图: [[1,4],[2,5],[3,6]]
 
 具体实现：[attention.py](src/myvllm/layers/attention.py)
 性能测试：[benchmark_decoding.py](benchmark_decoding.py)
+
+**`Attention` 类总览（`attention.py:468-535`）：**
+
+`Attention` 是统一的入口类，内部根据 `context.is_prefill` 决定走 prefill 还是 decode 路径：
+
+```python
+class Attention(nn.Module):
+    def __init__(self, num_heads, head_dim, scale=1.0, num_kv_heads=None,
+                 block_size=16, is_causal=True):
+        self.num_heads = num_heads          # 每 GPU 的 Q head 数
+        self.num_kv_heads = num_kv_heads    # 每 GPU 的 KV head 数
+        self.k_cache = self.v_cache = torch.tensor([])  # 稍后由 ModelRunner 注入
+
+    def forward(self, q, k, v):
+        context = get_context()
+        # 1. 将当前 K/V 写入 paged cache（仅 decode 路径）
+        if k_cache.numel() > 0 and context.slot_mapping is not None:
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping, self.block_size)
+
+        scale = self.scale / (self.head_dim ** 0.5)
+
+        if context.is_prefill:
+            # 2a. Prefill：Flash Attention（变长，online softmax）
+            o = flash_attention_prefill(q, k, v, context.cu_seqlens_q, scale, ...)
+        else:
+            # 2b. Decode：Paged Attention（遍历 paged cache）
+            o = paged_attention_decode(q, k_cache, v_cache,
+                                       context.block_tables, context.context_lens, ...)
+        return o.reshape(o.shape[0], self.num_heads * self.head_dim)
+```
+
+**Context 单例模式（`utils/context.py`）：**
+
+`Attention` 不通过参数传递元数据，而是通过模块级单例 `Context` 获取：
+
+```python
+@dataclass
+class Context:
+    is_prefill: bool = False
+    cu_seqlens_q: torch.Tensor | None = None
+    slot_mapping: torch.Tensor | None = None
+    context_lens: torch.Tensor | None = None
+    block_tables: torch.Tensor | None = None
+    ...
+
+_context = Context()
+def get_context() -> Context: return _context
+def set_context(...): global _context; _context = Context(...)
+def reset_context(): global _context; _context = Context()
+```
+
+`ModelRunner` 在每次 `run()` 前调用 `set_context()`，`Attention` 和各层通过 `get_context()` 读取。执行完毕后 `reset_context()` 清理状态。
 
 **关键张量概念（Key Tensor Concepts）：**
 - **`stride()`**：当一个张量存储在内存中时，本质上是一个连续的一维数组。stride 用来描述：沿着某个维度移动到“下一个元素”时，需要在底层内存中跳过多少个元素。
@@ -268,6 +574,56 @@ offset = (physical_block * block_size * num_kv_heads * head_dim   # 跳过前面
 #### Step 2：把新的 K/V 写入 cache
 
 `store_kvcache` 启动 `(num_tokens, num_kv_heads)` 的 grid。每个 program 把一个 token 在一个头上的 K 和 V 拷贝到 `slot_mapping[token]` 指定的槽位，该映射由 ModelRunner 预先算好。`slot_mapping` 为 `-1` 表示跳过该 token。
+
+**源码解析（`attention.py:7-108`）：**
+
+```python
+@triton.jit
+def store_kvcache_kernel(key_ptr, value_ptr, k_cache_ptr, v_cache_ptr,
+                         slot_mapping_ptr, num_kv_heads, head_dim, block_size):
+    token_idx = tl.program_id(0)       # 第几个 token
+    head_idx = tl.program_id(1)        # 第几个 KV head
+
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+    if slot_idx == -1:
+        return                          # 跳过不需要写入的 token
+
+    # 从 slot_idx 反算出 block 和 block 内偏移
+    block_idx = slot_idx // block_size
+    block_offset = slot_idx % block_size
+
+    # 输入偏移：(num_tokens, num_kv_heads, head_dim) 的展平索引
+    input_offset = token_idx * num_kv_heads * head_dim + head_idx * head_dim + head_offsets
+
+    # Cache 偏移：(num_blocks, block_size, num_kv_heads, head_dim) 的展平索引
+    cache_offset = (block_idx * block_size * num_kv_heads * head_dim
+                    + block_offset * num_kv_heads * head_dim
+                    + head_idx * head_dim + head_offsets)
+
+    key = tl.load(key_ptr + input_offset)
+    value = tl.load(value_ptr + input_offset)
+    tl.store(k_cache_ptr + cache_offset, key)
+    tl.store(v_cache_ptr + cache_offset, value)
+```
+
+**`slot_mapping` 的计算逻辑（`model_runner.py:336-340`）：**
+
+在 `prepare_prefill` 中，只为**未缓存**的 blocks 生成 slot：
+```python
+for i, block_id in enumerate(seq.block_table[seq.num_cached_blocks:]):
+    if seq.num_cached_blocks + i != seq.num_blocks - 1:
+        # 非最后一块：整块都是新 token
+        slot_mappings.extend(range(block_id * block_size, (block_id+1) * block_size))
+    else:
+        # 最后一块：可能不满
+        slot_mappings.extend(range(block_id * block_size,
+                                   block_id * block_size + seq.last_block_num_tokens))
+```
+
+在 `prepare_decode` 中，每个序列只有一个新 token：
+```python
+slot = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+```
 
 #### Step 3：Prefill —— 变长注意力
 
@@ -407,6 +763,70 @@ uv run python benchmark_decoding.py --block-size 16 --seq-lens 1000  # 单个配
 
 为具备位置信息的注意力实现旋转位置嵌入（rotary position embeddings）。
 
+**源码解析（`rotary_embedding.py:48-109`）：**
+
+```python
+class RotaryEmbedding(nn.Module):
+    def __init__(self, base, rotary_embedding, max_position=2048, is_llama3=False, ...):
+        # 计算逆频率：θ_i = 1 / (base^(2i/d))
+        self.inv_freq = 1 / (base ** (torch.arange(0, rotary_embedding, 2) / rotary_embedding))
+
+        if is_llama3:
+            # Llama 3.2 的频率缩放（详见下文）
+            ...
+
+        # 预计算 cos/sin 缓存表
+        positions = torch.arange(max_position).float()
+        freqs = torch.einsum("i,j -> ij", positions, self.inv_freq)  # (max_pos, dim/2)
+        cos_sin_cache = torch.cat([cos, sin], dim=-1)                 # (max_pos, dim)
+        self.register_buffer("cos_sin_cache", cos_sin_cache)
+
+    @torch.compile
+    def forward(self, positions, query, key):
+        cos_sin = self.cos_sin_cache[positions]   # 按位置索引查表
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        return (apply_rotary_pos_emb(query, cos, sin),
+                apply_rotary_pos_emb(key, cos, sin))
+```
+
+**旋转操作 `apply_rotary_pos_emb`（`rotary_embedding.py:4-45`）：**
+
+```python
+def apply_rotary_pos_emb(x, cos, sin):
+    # 将 x 沿 head_dim 对半切分
+    x1, x2 = x.chunk(2, dim=-1)
+    # 旋转：[x1*cos - x2*sin, x1*sin + x2*cos]
+    out1 = x1 * cos - x2 * sin
+    out2 = x1 * sin + x2 * cos
+    return torch.cat([out1, out2], dim=-1)
+```
+
+**数学原理：**
+
+RoPE 将位置信息编码为旋转矩阵，使得两个位置的注意力分数只取决于它们的**相对距离**：
+
+```
+R(θ, m) = diag(cos(mθ₁), cos(mθ₁), cos(mθ₂), cos(mθ₂), ...)
+        + diag(-sin(mθ₁), sin(mθ₁), -sin(mθ₂), sin(mθ₂), ...) · P
+
+其中 θᵢ = base^(-2i/d)，m 为位置索引，P 为置换矩阵
+```
+
+**Llama 3.2 的频率缩放（`rotary_embedding.py:69-87`）：**
+
+```python
+if is_llama3:
+    wave_len = 2 * math.pi / inv_freq
+    # 计算平滑因子
+    smooth = (original_max_pos / wave_len - low_freq_factor) / (high_freq_factor - low_freq_factor)
+    smooth = torch.clamp(smooth, 0, 1)
+    factor = (1 - smooth) / rope_factor + smooth
+    inv_freq = factor * inv_freq
+```
+
+- **高频分量**（`wave_len` 短）：`smooth ≈ 1`，频率几乎不变 → 模型已见过足够多周期
+- **低频分量**（`wave_len` 长）：`smooth ≈ 0`，频率除以 `rope_factor` → 压缩位置以适应训练范围
+
 **理解 base 参数（Understanding Base Parameter）：**
 
 1. **base 越大 → 频率越低：**
@@ -445,6 +865,73 @@ uv run python benchmark_decoding.py --block-size 16 --seq-lens 1000  # 单个配
 具体实现：[qwen3.py](src/myvllm/models/qwen3.py)
 
 组合所有层，构建完整的 Qwen 模型。
+
+**源码架构（`qwen3.py`）：**
+
+```
+Qwen3ForCausalLM
+├── Qwen3Model
+│   ├── VocabParallelEmbedding          — 词表嵌入（TP 切分）
+│   ├── Qwen3DecoderLayer × num_layers  — 解码器层堆叠
+│   │   ├── LayerNorm (input)           — 输入归一化
+│   │   ├── Qwen3Attention              — 自注意力
+│   │   │   ├── QKVColumnParallelLinear — QKV 投影（TP 列切分）
+│   │   │   ├── LayerNorm (q_norm/k_norm) — Q/K 归一化
+│   │   │   ├── RotaryEmbedding         — 旋转位置编码
+│   │   │   ├── Attention               — Flash/Paged Attention
+│   │   │   └── RowParallelLinear       — 输出投影（TP 行切分 + all_reduce）
+│   │   ├── LayerNorm (post_attn)       — 注意力后归一化
+│   │   └── Qwen3MLP                    — 前馈网络
+│   │       ├── MergedColumnParallelLinear (gate_up) — gate+up 合并投影
+│   │       ├── SiluAndMul              — SwiGLU 激活
+│   │       └── RowParallelLinear (down) — down 投影
+│   └── LayerNorm (final)               — 最终归一化
+└── ParallelLMHead                      — LM Head（TP 词表切分 + gather）
+```
+
+**`Qwen3DecoderLayer.forward` 完整流程（`qwen3.py:197-225`）：**
+
+```python
+def forward(self, x, residual=None):
+    # 1. 输入归一化 + 残差连接
+    if residual is not None:
+        x, residual = self.input_layernorm(x, residual)
+    else:
+        residual = x
+        x = self.input_layernorm(x)
+
+    # 2. 计算位置编码（prefill 时按序列边界重置，decode 时用 context_lens - 1）
+    context = get_context()
+    if context.is_prefill and context.cu_seqlens_q is not None:
+        positions = []
+        for i in range(len(cu_seqlens) - 1):
+            seq_len = cu_seqlens[i+1] - cu_seqlens[i]
+            positions.extend(range(seq_len))
+    else:
+        positions = context.context_lens - 1
+
+    # 3. 自注意力
+    x = self.self_attn(x, positions=positions)
+
+    # 4. 后注意力归一化 + 残差
+    x, residual = self.post_attention_layernorm(x, residual)
+
+    # 5. MLP
+    x = self.mlp(x)
+    return x, residual
+```
+
+**`Qwen3Model.forward`（`qwen3.py:273-279`）：**
+
+```python
+def forward(self, input_ids):
+    x = self.embed_tokens(input_ids)    # (total_tokens, hidden_size)
+    residual = None
+    for layer in self.layers:
+        x, residual = layer(x, residual)
+    x, _ = self.norm(x, residual)       # 最终归一化 + 最后一次残差
+    return x
+```
 
 **关键架构决策（Key Architecture Decisions）：**
 
@@ -495,8 +982,44 @@ uv run python benchmark_decoding.py --block-size 16 --seq-lens 1000  # 单个配
 
 **目的：** 存储一个序列的全部信息（prompt + 生成的 tokens）。
 
-**关键实现细节：**
+**源码解析（`sequence.py:14-89`）：**
 
+```python
+class Sequence:
+    counter = count()  # 类级别的全局自增 ID 生成器
+
+    def __init__(self, token_ids, block_size, sampling_params=SamplingParams()):
+        self.block_size = block_size
+        self.seq_id = next(Sequence.counter)       # 唯一序列 ID
+        self.status = SequenceStatus.WAITING       # 初始状态
+        self.token_ids = copy(token_ids)           # 必须 copy！
+        self.num_tokens = len(self.token_ids)
+        self.num_prompt_tokens = len(self.token_ids)
+        self.num_cached_tokens = 0                 # 前缀缓存命中数
+        self.block_table = []                      # 物理 block ID 列表
+        self.temperature = sampling_params.temperature
+        self.max_tokens = sampling_params.max_tokens
+
+    # 关键属性
+    @property
+    def num_completion_tokens(self):
+        return self.num_tokens - self.num_prompt_tokens
+
+    @property
+    def num_blocks(self):
+        return int(math.ceil(self.num_tokens / self.block_size))
+
+    @property
+    def last_block_num_tokens(self):
+        return self.num_tokens - max(self.num_blocks - 1, 0) * self.block_size
+
+    def append_token(self, token_id):
+        self.token_ids.append(token_id)
+        self.last_token = token_id
+        self.num_tokens += 1
+```
+
+**关键实现细节：**
 
 ```python
 # In __init__:
@@ -506,15 +1029,31 @@ self.token_ids = copy(token_ids)  # MUST copy! Creates new list
 **为什么要使用`copy()`？** 如果不使用 `copy()`，`self.token_ids` 会引用外部传入的 list，并且会受到外部修改的影响。使用 `copy()` 可以保证内部数据独立。
 
 **序列状态跟踪：**
-- Waiting
-- Running  
-- Finished
+- `WAITING`：等待 prefill
+- `RUNNING`：正在生成
+- `FINISHED`：已完成（EOS / max_tokens / max_length）
 
 **重要属性：**
 - `token_ids`：所有 token（prompt + 生成）
 - `num_tokens`：当前长度
 - `block_table`：该序列的 KV cache 存储在哪些内存块中
 - `status`：该序列在系统中的当前状态
+- `num_cached_tokens`：前缀缓存命中的 token 数（用于跳过已缓存的 KV）
+
+**跨进程序列化（`sequence.py:91-127`）：**
+
+`__getstate__` / `__setstate__` 用于 TP 多卡时 rank 0 → worker 的共享内存 RPC 传输：
+```python
+def __getstate__(self):
+    return (
+        self.num_tokens,
+        self.num_prompt_tokens,
+        self.num_cached_tokens,
+        self.block_table,
+        # prefill 传完整 token_ids，decode 只传 last_token 以省带宽
+        self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+    )
+```
 
 
 ---
@@ -525,6 +1064,26 @@ self.token_ids = copy(token_ids)  # MUST copy! Creates new list
 
 
 **目的：** 表示一个固定大小的内存块，用于存储 KV cache。
+
+**源码解析（`block_manager.py:7-27`）：**
+
+```python
+class Block:
+    def __init__(self, block_id):
+        self.block_id = block_id    # 物理块编号（在 cache 池中的位置）
+        self.hash = -1              # 内容哈希（-1 表示未计算/部分块）
+        self.ref_count = 0          # 引用计数
+        self.token_ids = []         # 该块存储的 token 列表
+
+    def update(self, h, token_ids):
+        self.hash = h
+        self.token_ids = token_ids
+
+    def reset(self):
+        self.hash = -1
+        self.ref_count = 1          # 分配即引用，从 1 开始
+        self.token_ids = []
+```
 
 **关键概念：**
 
@@ -539,18 +1098,30 @@ self.token_ids = copy(token_ids)  # MUST copy! Creates new list
 - 做哈希：`hash_value = compute_hash([1,2,3,...,256])` → `block_id = hash_to_block_id.get(hash_value)`
 - 只有当 block 被填满（256 个 token 全部就位）时才计算 hash
 
+**哈希计算源码（`block_manager.py:43-48`）：**
+```python
+def compute_hash(self, token_ids, prefix_hash_value):
+    h = xxhash.xxh64()
+    if prefix_hash_value != -1:
+        h.update(prefix_hash_value.to_bytes(8, 'little'))  # 链式哈希
+    h.update(np.array(token_ids, dtype=np.int32).tobytes())
+    return h.intdigest()
+```
+
 **为什么哈希函数的参数要包含 prefix？**
 - 即使当前 block 的 tokens 相同，也能在不同上下文中保持唯一性
 - 例子：`[prefix_hash_1][1,2,3]` 与 `[prefix_hash_2][1,2,3]` 是不同的
+- 链式哈希确保：`hash(block_i) = f(hash(block_{i-1}), tokens_i)`
 
 **为什么在 reset() 里设置 `ref_count = 1`？**
 - 当一个 block 被分配时（`_allocate_block` 会调用 `reset()`），它会立刻被某个序列使用
-- 从 1（而不是 0）开始，反映了这种“立即被使用”的状态
+- 从 1（而不是 0）开始，反映了这种"立即被使用"的状态
+- 如果从 0 开始，`deallocate()` 会把 `ref_count` 减到 -1，导致 block 永远不会被释放
 
-**缓存未命中检测：**
+**缓存未命中检测（`block_manager.py:91`）：**
 ```python
 if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-    cache_miss = True
+    no_cache_found = True
 ```
 
 **为什么要同时检查这两个条件？**
@@ -565,24 +1136,92 @@ if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
 
 **目的：** 管理所有序列的 KV cache 显存分配/释放。
 
+**源码架构（`block_manager.py:28-160`）：**
+
+```python
+class BlockManager:
+    def __init__(self, num_blocks, block_size):
+        self.block_size = block_size
+        self.blocks = [Block(i) for i in range(num_blocks)]  # 所有物理块
+        self.hash_to_block_id = {}                            # 哈希 → 块 ID（前缀缓存）
+        self.free_block_ids = deque(range(num_blocks))        # 空闲块队列
+        self.used_block_ids = set()                           # 已用块集合
+```
+
 **关键方法：**
 
-**`can_append(seq)`：**
-- 检查 GPU 上是否还有可用的 block / 空间，用于给该序列再追加一个 token
-- 返回 True/False
+**`allocate(seq)`（`block_manager.py:80-113`）—— 为序列分配 blocks（含前缀缓存）：**
 
-**`append()`：**
-- 在需要时实际分配新的 block
-- 在 `can_append()` 返回 True 之后调用
-- 负责维护与更新 block table
+```python
+def allocate(self, seq):
+    h = -1  # 初始前缀哈希为 -1
+    for i in range(seq.num_blocks):
+        token_ids = seq.block(i)
+        # 只有满块才计算哈希（部分块不缓存）
+        h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
+        block_id = self.hash_to_block_id.get(h, -1)
 
-**`allocate_with_cache(seq)`：**
-- 尝试复用已缓存的 block（前缀缓存 prefix caching）
-- 只为未命中的 tokens 分配新 block
+        # 缓存未命中或哈希碰撞
+        if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            block = self._allocate_block(self.free_block_ids[0])
+            block.update(h=h, token_ids=token_ids)
+            if h != -1:
+                self.hash_to_block_id[h] = block.block_id
+        else:
+            # 缓存命中！复用已有块
+            seq.num_cached_tokens += self.block_size
+            block = self.blocks[block_id]
+            block.ref_count += 1
 
-**`deallocate(seq)`：**
-- 将该序列使用到的所有 block 的 `ref_count` 递减
-- 当 `ref_count` 变为 0 时释放对应 block
+        seq.block_table.append(block.block_id)
+```
+
+**`can_append(seq)`（`block_manager.py:128-136`）：**
+```python
+def can_append(self, seq):
+    # 只有当新 token 是某块的第 1 个 token 时才需要新块
+    # （num_tokens % block_size == 1 意味着上一块已满，需要新块）
+    if seq.num_tokens % self.block_size == 1:
+        return len(self.free_block_ids) > 0
+    return True  # 当前块还有空间
+```
+
+**`append(seq)`（`block_manager.py:141-160`）：**
+```python
+def append(self, seq):
+    last_block_id = seq.block_table[-1]
+
+    if seq.num_tokens % self.block_size == 0:
+        # 当前块刚满 → 计算哈希并注册到缓存
+        h = self.compute_hash(seq.block(seq.num_blocks - 1), prefix_hash)
+        block.update(h=h, token_ids=seq.block(seq.num_blocks - 1))
+        self.hash_to_block_id[h] = block.block_id
+
+    elif seq.num_tokens % self.block_size == 1:
+        # 需要新块
+        block = self._allocate_block(self.free_block_ids[0])
+        seq.block_table.append(block.block_id)
+
+    else:
+        # 当前块还有空间，什么都不做
+        pass
+```
+
+**`deallocate(seq)`（`block_manager.py:115-124`）：**
+```python
+def deallocate(self, seq):
+    for block_id in seq.block_table:
+        block = self.blocks[block_id]
+        block.ref_count -= 1
+        if block.ref_count == 0:
+            self._deallocate_block(block_id)  # 归还空闲队列
+    seq.block_table = []
+    seq.num_cached_tokens = 0
+```
+
+**`_deallocate_block` 的缓存清理策略（`block_manager.py:59-73`）：**
+
+释放时**清空 `token_ids`**，这使得该块在后续 `allocate` 中无法被匹配到（即使哈希表中仍有记录）。这是一个刻意的设计——当前版本的 prefill kernel 不读 `block_tables`，RoPE 位置也直接从 `cu_seqlens_q` 推导，所以跨序列的缓存复用会导致位置和注意力计算错误。清空 `token_ids` 是保持正确性的守卫。
 
 
 ---
@@ -593,9 +1232,29 @@ if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
 
 **目的：** 作为序列与模型执行之间的桥梁。负责数据准备、CUDA Graph 优化以及采样。
 
+**源码架构（`model_runner.py`）：**
+
+```python
+class ModelRunner:
+    def __init__(self, config, rank, event):
+        # 1. 初始化分布式进程组
+        dist.init_process_group('nccl', "tcp://localhost:12345", ...)
+        # 2. 根据模型名创建模型实例
+        match model_name:
+            case 'Qwen3-0.6B': self.model = Qwen3ForCausalLM(...)
+            case 'Llama-3.2-1B-Instruct': self.model = LlamaForCausalLM(...)
+        # 3. 移到 GPU 并加载权重
+        self.model = self.model.cuda(rank)
+        load_weights_from_checkpoint(self.model, config['model_name_or_path'])
+        # 4. warmup → 分配 KV cache → 捕获 CUDA graph
+        self.warmup_model()
+        self.allocate_kv_cache()
+        self.capture_cudagraph()
+```
+
 ### 4.1 权重加载
 
-可以在CPU或GPU中加载权重，不同设备中进行模型的权重加载可能会导致权重出现问题。具体可以查看 [Issues #36](https://github.com/Wenyueh/MinivLLM/issues/36)。
+可以在CPU或GPU中加载权重，不同设备中进行模型的权重加载可能会导致权重出问题。具体可以查看 [Issues #36](https://github.com/Wenyueh/MinivLLM/issues/36)。
 
 ```python
 # Load weights in GPU (model moved to GPU before loading weights)
@@ -609,6 +1268,32 @@ if config.get('model_name_or_path'):
 # Load weights in CPU (move the model to GPU after loading weights)
 # self.model = self.model.cuda(rank)
 ```
+
+**权重加载器源码解析（`utils/loader.py:16-214`）：**
+
+`load_weights_from_checkpoint` 的核心逻辑是处理 HF checkpoint 与自定义模型之间的名称映射：
+
+```python
+for hf_name, hf_weight in hf_weights.items():
+    # 1. QKV 合并：q_proj + k_proj + v_proj → qkv_projection
+    if '.self_attn.q_proj.weight' in hf_name:
+        qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+        param = model.get_parameter(f"model.layers.{i}.self_attn.qkv_projection.weight")
+        param.data.copy_(qkv_weight)
+
+    # 2. gate_up 合并：gate_proj + up_proj → gate_up
+    elif '.mlp.gate_proj.weight' in hf_name:
+        gate_up_weight = torch.cat([gate_weight, up_weight], dim=0)
+        param = model.get_parameter(f"model.layers.{i}.mlp.gate_up.weight")
+        param.data.copy_(gate_up_weight)
+
+    # 3. 其他参数直接按名称匹配
+    else:
+        param = model.get_parameter(hf_name)
+        param.data.copy_(hf_weight)
+```
+
+**注意：** 此加载器直接 `copy_` 到 `param.data`，绕过了参数上的 `weight_loader` 方法。这意味着在 TP > 1 时，每个 rank 都会加载完整权重再各自 `copy_`——这对单卡没问题，但多卡场景需要走 `loader_vl.py` 中的 TP-aware 路径。
 
 ### 4.2 核心函数概览
 
@@ -637,35 +1322,93 @@ def capture_cudagraph(self): pass # 捕获 CUDA graphs 用于优化
 
 ### 4.3 共享内存通信
 
+**源码解析（`model_runner.py:172-227`）：**
+
 **`read_shm()`：**（Worker 进程从 master 进程读取）
 
 ```python
-n = int.from_bytes(self.shm.buf[0:4], "little")
+def read_shm(self):
+    self.event.wait()                              # 阻塞等待信号
+    n = int.from_bytes(self.shm.buf[:4], 'little') # 前 4 字节是数据长度
+    method_name, *args = pickle.loads(self.shm.buf[4:n+4])  # 反序列化
+    self.event.clear()                             # 清除信号
+    return method_name, args
 ```
+
 **为什么长度用 4 字节？** 写入端无论 `n` 的值是多少，都固定用 4 字节来写：`n.to_bytes(4, "little")`。
 
+**共享内存布局：**
+```
+┌──────────┬──────────────────────────────────────┐
+│ 4 bytes  │ n bytes (pickle 数据)                 │
+│ 长度 n   │ (method_name, arg1, arg2, ...)       │
+└──────────┴──────────────────────────────────────┘
+```
+
 **同步机制（Synchronization）：**
-- `self.event.wait()`：阻塞等待，直到 master 调用 `event.set()` 发出“消息已就绪”的信号
-- `self.event.clear()`：清除信号，为下一条消息重置状态（回到“未就绪”）
+- `self.event.wait()`：阻塞等待，直到 master 调用 `event.set()` 发出"消息已就绪"的信号
+- `self.event.clear()`：清除信号，为下一条消息重置状态（回到"未就绪"）
 
 **`write_shm()`：**（Master 进程写入给 workers）
 
-
 ```python
-for event in self.events:  # Note: plural, list of events
-    event.set()
+def write_shm(self, method_name, args):
+    data = pickle.dumps((method_name, *args))      # 序列化
+    n = len(data)
+    self.shm.buf[:4] = n.to_bytes(4, 'little')    # 写长度
+    self.shm.buf[4:n+4] = data                     # 写数据
+    for event in self.event:                       # 通知所有 worker
+        event.set()
 ```
+
 **为什么使用循环?** 每个worker对应一个event - master 将信号分别发送给每个worker.
 
+**`call()` 方法——master 和 worker 共用（`model_runner.py:221-227`）：**
+
+```python
+def call(self, method_name, *args):
+    if self.world_size > 1 and self.rank == 0:
+        self.write_shm(method_name, args)          # master 写共享内存
+    method = getattr(self, method_name, None)
+    if method:
+        return method(*args)                       # 所有 rank 都执行同一方法
+```
+
+**Worker 主循环（`model_runner.py:209-216`）：**
+
+```python
+def loop(self):
+    while True:
+        method_name, args = self.read_shm()        # 等待并读取
+        self.call(method_name, *args)              # 执行
+        if method_name == 'exit':
+            self.exit()
+            break
+```
+
 **关于 `self.event` vs `self.events` 的说明：**
-- Master：`self.events = [Event(), Event(), Event()]`（列表）
-- Worker：`self.event = Event()`（单个）
+- Master（rank 0）：`self.event = [Event(), Event(), ...]`（列表，每个 worker 一个）
+- Worker（rank ≠ 0）：`self.event = Event()`（单个，只监听自己的信号）
 
 ---
 
 ### 4.4 内存管理
 
-**`warmup_model()`:**
+**`warmup_model()`（`model_runner.py:233-241`）：**
+
+```python
+def warmup_model(self):
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    max_tokens = self.config['max_num_batch_tokens']
+    max_model_length = self.config['max_model_length']
+    batch_size = max_tokens // max_model_length
+    # 构造最大 batch 的虚拟序列
+    seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.block_size)
+            for _ in range(batch_size)]
+    self.run(seqs, is_prefill=True)       # 跑一遍 prefill
+    torch.cuda.empty_cache()
+```
 
 **为什么在处理请求前先 warmup？**
 - 用于测量显存：跑一遍最大 batch 来估计峰值显存占用
@@ -673,31 +1416,104 @@ for event in self.events:  # Note: plural, list of events
 - 使用 `torch.cuda.memory_stats()['allocated_bytes.all.peak']`
 - 结果会在 `allocate_kv_cache()` 中用于计算可用显存
 
-**`allocate_kv_cache()`:**
+**`allocate_kv_cache()`（`model_runner.py:244-300`）：**
+
+```python
+def allocate_kv_cache(self):
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    total_free_mem = free_mem * gpu_memory_utilization
+    peak_mem = torch.cuda.memory_stats()['allocated_bytes.all.peak']
+    current_mem = torch.cuda.memory_stats()['allocated_bytes.all.current']
+    available_mem = total_free_mem - (peak_mem - current_mem)
+
+    # 每块所需字节数
+    block_bytes = block_size * 2 * num_layers * num_kv_heads * head_dim * itemsize
+    num_blocks = int(available_mem // block_bytes)
+
+    # 跨 rank 同步：取所有 rank 的最小值
+    if world_size > 1:
+        dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
+
+    # 一次性分配整个 KV cache 池
+    allocated_kv_cache = torch.zeros(
+        2, num_layers, num_blocks, block_size, num_kv_heads, head_dim,
+        device=f'cuda:{rank}')
+
+    # 将 cache 切片注入每个 Attention 层
+    for module in self.model.modules():
+        if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
+            module.k_cache = allocated_kv_cache[0, layer_id]
+            module.v_cache = allocated_kv_cache[1, layer_id]
+            layer_id += 1
+```
 
 **目的：** 基于 block_size，确定能够分配多少个 KV cache block。
+
+**KV cache 内存布局：**
+```
+shape: (2, num_layers, num_blocks, block_size, num_kv_heads, head_dim)
+        │    │           │            │            │            │
+        │    │           │            │            │            └─ 每个 head 的维度
+        │    │           │            │            └─ 每 GPU 的 KV head 数
+        │    │           │            └─ 每块存 block_size 个 token
+        │    │           └─ 总块数（所有序列共享的扁平池）
+        │    └─ 模型层数
+        └─ 0=K, 1=V
+```
 
 **关键设计：**
 - 为峰值占用预留显存（即使并非全部在用）
 - 预留的是**模型级别**的显存，而不是每个序列各自预留
-- 使用 `slot_mapping` 跟踪“哪个序列的哪个 token”写到哪个位置
+- 使用 `slot_mapping` 跟踪"哪个序列的哪个 token"写到哪个位置
 - 这是实现 **PagedAttention** 的关键
+- 跨 rank 同步取 MIN：确保所有 GPU 使用相同的 block 数量，避免某个 rank OOM
 
 ---
 
 ### 4.5 数据准备
 
-**`prepare_prefill(seqs)`：**
+**`prepare_prefill(seqs)`（`model_runner.py:312-361`）：**
 
 **目的：** 为 prefill 前向计算准备数据，并支持前缀缓存（prefix caching）。
 
+**源码解析：**
+
+```python
+def prepare_prefill(self, seqs):
+    input_ids = []
+    slot_mappings = []
+    cu_seqlens_q = [0]
+    cu_seqlens_k = [0]
+
+    for seq in seqs:
+        num_cached = seq.num_cached_tokens
+        # 只取未缓存的 token（前缀缓存命中的部分跳过）
+        input_ids.extend(seq.token_ids[num_cached:])
+        # Q 长度 = 未缓存 token 数
+        seqlens_q.append(len(seq) - num_cached)
+        # K 长度 = 全部 token 数（attention 需要看所有历史）
+        seqlens_k.append(len(seq))
+        cu_seqlens_q.append(cu_seqlens_q[-1] + seqlens_q[-1])
+        cu_seqlens_k.append(cu_seqlens_k[-1] + seqlens_k[-1])
+
+        # slot_mapping：只为未缓存的 blocks 生成写入位置
+        for i, block_id in enumerate(seq.block_table[seq.num_cached_blocks:]):
+            if seq.num_cached_blocks + i != seq.num_blocks - 1:
+                slot_mappings.extend(range(block_id * block_size, (block_id+1) * block_size))
+            else:
+                slot_mappings.extend(range(block_id * block_size,
+                                           block_id * block_size + seq.last_block_num_tokens))
+
+    # 设置 Context 单例
+    set_context(is_prefill=True, cu_seqlens_q=..., slot_mapping=..., ...)
+    return input_ids
+```
+
 **输出：**
-- `input_ids`：所有序列的全部 tokens 合并成一个 list
-- `positions`：每个 token 的 position 索引
+- `input_ids`：所有序列的未缓存 tokens 合并成一个 1D tensor
 - `cu_seqlens_q/k`：累计序列长度（用于标记边界）
 - `slot_mapping`：新 KV 应写入的位置
-- `block_tables`：KV 应从哪里读取
-
+- `block_tables`：KV 应从哪里读取（仅在有前缀缓存时需要）
 
 **为什么把 input_ids 展平成一个 list？**
 - FlashAttention 的要求：单次 kernel launch
@@ -710,14 +1526,10 @@ for event in self.events:  # Note: plural, list of events
   └────────── start (position 0)
   ```
 
-**为什么没有 `cu_seqlens_v`？**
-- 与 K 相同（key 和 value 的序列结构一致）
-
-**为什么要准备长度匹配的 block_tables？**
-- Attention kernel 需要读取 KV cache：
-  ```python
-  k = kv_cache[..., block_id * block_size : (block_id+1) * block_size, ...]
-  ```
+**为什么 `cu_seqlens_q` 和 `cu_seqlens_k` 可能不同？**
+- 当有前缀缓存时，`seqlens_q` = 未缓存 token 数，`seqlens_k` = 全部 token 数
+- 例如：序列有 512 个 token，前 256 个命中缓存 → `seqlens_q=256, seqlens_k=512`
+- 当前版本的 flash attention kernel 只用 `cu_seqlens_q`，所以跨序列缓存复用尚未完全启用
 
 **为什么 `pin_memory=True`?**
 - **Pinned memory** = 物理内存页锁定（不能被 swap 到磁盘）
@@ -740,9 +1552,35 @@ for event in self.events:  # Note: plural, list of events
 
 ---
 
-**`prepare_decode(seqs)`:**
+**`prepare_decode(seqs)`（`model_runner.py:365-390`）：**
 
 **目的:** 为解码阶段准备数据（每个序列一个 token）。
+
+**源码解析：**
+
+```python
+def prepare_decode(self, seqs):
+    input_ids = []
+    context_lens = []
+    slot_mappings = []
+    block_tables = []
+
+    for seq in seqs:
+        input_ids.append(seq.last_token)           # 只取最后一个 token
+        context_lens.append(len(seq))              # 序列总长度
+        # 新 token 的 slot = 最后一块的起始 + 块内已有 token 数 - 1
+        slot_mappings.append(
+            seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+
+    # block_tables 需要 padding 到相同长度
+    max_num_blocks = max(len(seq.block_table) for seq in seqs)
+    for seq in seqs:
+        block_table = seq.block_table + [-1] * (max_num_blocks - len(seq.block_table))
+        block_tables.append(block_table)
+
+    set_context(is_prefill=False, slot_mapping=..., context_lens=..., block_tables=...)
+    return input_ids
+```
 
 **新的 slot 映射:**
 ```python
@@ -764,39 +1602,89 @@ new_slot = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
 
 ---
 
-**`prepare_sample(seqs)`:**
+**`prepare_sample(seqs)`（`model_runner.py:393-394`）：**
 
-**目的:** 准备温度（temperature）数值（并通过 padding 对齐 batch size）。
+```python
+def prepare_sample(self, seqs):
+    return torch.tensor([seq.temperature for seq in seqs],
+                        dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+```
+
+**目的:** 准备温度（temperature）数值，用于采样时的 logits 缩放。
 
 ---
 
 ### 4.6 模型执行
 
-**`run_model()`:**
+**`run_model()`（`model_runner.py:400-425`）：**
 
 **用于 Prefill：** 直接计算前向传播。
 
 **用于 Decode：** 使用 CUDA Graph 来提升速度！
 
 ```python
-graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+@torch.inference_mode()
+def run_model(self, input_ids, is_prefill):
+    if is_prefill or self.enforce_eager:
+        hidden_states = self.model(input_ids)
+        logits = self.model.compute_logits(hidden_states)
+    else:
+        bs = input_ids.size(0)
+        # 找到能容纳当前 batch 的最小已捕获 graph
+        graph = self.graphs[next(bs_ for bs_ in self.graphs if bs_ >= bs)]
+        vars = self.graph_vars
+
+        # 将实际数据拷贝进 graph 的预分配 buffer
+        vars['input_ids'][:bs].copy_(input_ids)
+        vars['slot_mapping'][:bs].fill_(-1)          # 哨兵值
+        vars['slot_mapping'][:bs].copy_(context.slot_mapping)
+        vars['context_lens'].zero_()
+        vars['context_lens'][:bs].copy_(context.context_lens)
+        vars['block_tables'][:bs, :n] = context.block_tables
+
+        graph.replay()                               # 回放 CUDA graph
+        logits = self.model.compute_logits(vars['outputs'][:bs])
+    return logits
 ```
+
 **为什么要找到能容纳的最小图？**
 - 并不是每个 batch size 都一定有已捕获的图
 - 通过 padding 复用更大的图
+- 例如：捕获了 `[1, 2, 4, 8, 16]`，当前 bs=3 → 使用 bs=4 的图
 
 **为什么要用哨兵值填充 `slot_mapping` 和 `context_lens`？**
 - 使用的图比实际需求更大 → 用虚拟值填充未使用的槽位
+- `slot_mapping` 填 `-1`：`store_kvcache_kernel` 遇到 `-1` 会直接 `return`，跳过写入
+- `context_lens` 填 `0`：`paged_attention_decode_kernel` 中 `token_start < context_len` 为 False，跳过计算
+
 ---
 
-**`run()`:**
+**`run()`（`model_runner.py:433-447`）：**
+
+```python
+def run(self, seqs, is_prefill):
+    if is_prefill:
+        input_ids = self.prepare_prefill(seqs)
+    else:
+        input_ids = self.prepare_decode(seqs)
+
+    logits = self.run_model(input_ids, is_prefill)
+
+    token_ids = None
+    if self.rank == 0:
+        token_ids = self.sampler(logits, self.prepare_sample(seqs))
+
+    reset_context()                                  # 清理 Context 单例
+    return token_ids
+```
 
 **主入口：**
-1. 组合 `prepare_prefill` + `run_model` + `sample`
+1. 组合 `prepare_prefill/decode` + `run_model` + `sample`
 2. 调用 `reset_context()` 清除缓存数据
 
 **为什么只有 rank 0 进行采样？**
-- 在张量并行中，**所有 rank 计算得到相同的 logits**（或通过 reduce/gather 汇总到 rank 0）
+- `ParallelLMHead` 使用 `dist.gather` 将 logits 汇总到 rank 0
+- 其他 rank 的 `compute_logits` 返回的是局部 logits（只有自己的词表分片）
 - 只需要 **采样一次** 即可得到 token ID
 - 避免重复采样或采样结果不一致
 
@@ -804,18 +1692,80 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 
 ### 4.7 CUDA Graph 优化
 
-**`capture_cudagraph()`:**
+**`capture_cudagraph()`（`model_runner.py:572-625`）：**
 
 **目的：** 记录 CUDA kernel 的执行序列以便快速回放（消除 kernel 启动开销）。
 
 **为什么只用于 decoding？**
-- Decode 的输入模式固定（每个序列 1 个 token）
-- Prefill 的输入长度可变
+- Decode 的输入模式固定（每个序列 1 个 token，batch_size 是唯一变量）
+- Prefill 的输入长度可变，无法预捕获
+
+**源码解析：**
+
+```python
+@torch.inference_mode()
+def capture_cudagraph(self):
+    max_bs = self.config['max_num_seqs']
+    max_num_blocks = math.ceil(max_len / self.block_size)
+
+    # 1. 预分配最大尺寸的 buffer（所有 graph 共享同一组内存）
+    input_ids = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{rank}')
+    slot_mapping = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{rank}')
+    context_lens = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{rank}')
+    block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{rank}')
+    outputs = torch.zeros(max_bs, vocab_size, device=f'cuda:{rank}')
+
+    # 2. 按 batch size 从大到小捕获
+    batch_sizes = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+    graph_pool = None
+
+    for batch_size in reversed(batch_sizes):        # 从最大 batch 开始
+        graph = torch.cuda.CUDAGraph()
+        set_context(slot_mapping=slot_mapping[:batch_size], ...)
+
+        # warmup：触发惰性内存分配
+        outputs[:batch_size] = self.model(input_ids[:batch_size])
+
+        # 正式捕获
+        with torch.cuda.graph(graph, graph_pool):
+            outputs[:batch_size] = self.model(input_ids[:batch_size])
+            if graph_pool is None:
+                graph_pool = graph.pool()           # 共享内存池
+
+        self.graphs[batch_size] = graph
+        torch.cuda.synchronize()                    # 确保捕获完成
+        reset_context()
+```
 
 **捕获策略：**
 - 在最大尺寸上预分配 buffer
 - 针对常见 batch size 进行捕获：`[1, 2, 4, 8] + list(range(16, max_bs + 1, 16))`
 - 先捕获最大 batch（内存池按最大场景进行尺寸规划）
+
+**为什么从大到小捕获？** 第一个 graph 创建 `graph_pool`，后续 graph 共享同一内存池。从最大 batch 开始确保池的尺寸足够大，后续较小的 graph 可以复用已分配的内存。
+
+**Graph 回放（`model_runner.py:407-423`）：**
+
+```python
+def run_model(self, input_ids, is_prefill):
+    if is_prefill or self.enforce_eager:
+        hidden_states = self.model(input_ids)
+        logits = self.model.compute_logits(hidden_states)
+    else:
+        bs = input_ids.size(0)
+        # 找到能容纳当前 batch 的最小已捕获 graph
+        graph = self.graphs[next(bs_ for bs_ in self.graphs if bs_ >= bs)]
+
+        # 将实际数据拷贝进 graph 的输入 buffer
+        vars['input_ids'][:bs].copy_(input_ids)
+        vars['slot_mapping'][:bs].fill_(-1)          # 哨兵值：跳过 padding 位置
+        vars['slot_mapping'][:bs].copy_(context.slot_mapping)
+        vars['context_lens'][:bs].copy_(context.context_lens)
+        vars['block_tables'][:bs, :n] = context.block_tables
+
+        graph.replay()                               # 回放捕获的 kernel 序列
+        logits = self.model.compute_logits(vars['outputs'][:bs])
+```
 
 **为什么在 capture 前要 warmup？**
 - CUDA graph 要求在 capture 之前完成所有内存分配
@@ -848,22 +1798,37 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 **torch.compile：**
 - 将多个操作融合成一个 kernel
 - 节省 kernel 执行时间
+- 在本项目中的使用位置：
+  - `SiluAndMul.forward`（`activation.py:15`）
+  - `LayerNorm.rms_forward`（`layernorm.py:16`）
+  - `RotaryEmbedding.forward`（`rotary_embedding.py:100`）
+  - `SamplerLayer.forward`（`sampler.py:14`）
 - 示例：
   ```python
   @torch.compile
-  def attention(q, k, v):
-      scores = q @ k.T         # ┐
-      probs = softmax(scores)  # ├─ Fused into ONE kernel
-      output = probs @ v       # ┘
-      return output
+  def rms_forward(self, x):
+      variance = x.pow(2).mean(dim=-1, keepdim=True) + self.eps  # ┐
+      sqrt_variance = variance.sqrt()                             # ├─ Fused
+      x_norm = (x / sqrt_variance * self.weight)                 # ┘
+      return x_norm
   ```
 
 **CUDA Graph：**
 - 记录 kernel 执行序列以便回放
 - 节省 kernel 启动开销（无需 CPU 参与）
-- 捕获执行图
+- 在本项目中的使用位置：`ModelRunner.capture_cudagraph`（`model_runner.py:572`）
+- 仅用于 decode 阶段（输入模式固定）
 
-**组合使用：** `torch.compile` 减少 kernel 数量，CUDA graph 消除启动开销。
+**对比：**
+
+| 维度 | torch.compile | CUDA Graph |
+|------|--------------|------------|
+| 优化目标 | kernel 融合 | kernel 启动开销 |
+| 适用场景 | 小算子（activation, norm） | 固定形状的完整 forward |
+| 编译时机 | 首次调用时 JIT 编译 | 初始化时预捕获 |
+| 输入约束 | 形状可变 | 形状必须与捕获时一致 |
+
+**组合使用：** `torch.compile` 减少 kernel 数量，CUDA graph 消除启动开销。在 decode 阶段，模型 forward 内部的 `rms_forward`、`rotary_emb` 等已经被 `torch.compile` 融合过，整个 forward 又被 CUDA graph 捕获，两者叠加效果。
 
 
 
@@ -877,6 +1842,18 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 
 ### 5.1 核心设计
 
+**源码架构（`scheduler.py:6-17`）：**
+
+```python
+class Scheduler:
+    def __init__(self, max_num_sequences, max_num_batched_tokens,
+                 max_cached_blocks, block_size, eos, ...):
+        self.block_manager = BlockManager(max_cached_blocks, block_size)
+        self.waiting: deque[Sequence] = deque()   # 等待 prefill 的新序列
+        self.running: deque[Sequence] = deque()   # 正在 decode 的序列
+        self.eos = eos
+```
+
 **两类队列：**
 1. **Waiting 队列**：尚未开始的新序列
 2. **Running 队列**：正在运行的序列
@@ -889,21 +1866,115 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 
 调度器 **总是先尝试 prefill**，即使 running 队列不为空！
 
+**源码解析（`scheduler.py:51-112`）：**
+
+```python
+def schedule(self):
+    scheduled_sequences = []
+    current_scheduled_tokens = 0
+    preempted = False
+
+    # ===== 阶段 1：尝试 prefill =====
+    while self.waiting and len(scheduled_sequences) < self.max_num_sequences:
+        seq = self.waiting[0]
+        if self.block_manager.can_allocate(seq) and \
+           len(seq) + current_scheduled_tokens <= self.max_num_batched_tokens:
+            seq = self.waiting.popleft()
+            self.block_manager.allocate(seq)          # 分配 blocks（含前缀缓存）
+            seq.status = SequenceStatus.RUNNING
+            self.running.append(seq)
+            scheduled_sequences.append(seq)
+            current_scheduled_tokens += len(seq)
+        else:
+            break
+
+    if scheduled_sequences:
+        return scheduled_sequences, True              # is_prefill=True
+
+    # ===== 阶段 2：decode =====
+    while self.running:
+        seq = self.running.popleft()
+        if not self.block_manager.can_append(seq):
+            # 显存不足 → 抢占
+            preempted = True
+            if self.running:
+                self.running.appendleft(seq)
+                self.preempt(self.running.pop())      # 抢占队尾序列
+            else:
+                self.preempt(seq)
+                break
+        else:
+            self.block_manager.append(seq)
+            scheduled_sequences.append(seq)
+            current_scheduled_tokens += 1             # decode 每序列只加 1 token
+
+    # 将调度好的序列按原顺序放回 running 队列
+    if scheduled_sequences:
+        self.running.extendleft(reversed(scheduled_sequences))
+
+    return scheduled_sequences, False                 # is_prefill=False
+```
+
 **调度流程：**
 1. **尝试加入 prefill 序列：**
-   - 检查 waiting 队列里的新序列能否放得下
+   - 检查 waiting 队列里的新序列能否放得下（block 容量 + token 预算）
    - 没有空间继续 prefill 时停止
 
 2. **如果没有新增 prefill，则调度 decode：**
    - 继续运行现有的 running 序列
    - 若没有空间容纳更多，则 **抢占** 优先级最低的序列
 
+**无进度守卫（`scheduler.py:99-110`）：**
+
+```python
+elif not preempted and (self.waiting or self.running):
+    raise RuntimeError(
+        "Scheduler made no progress: ..."
+    )
+```
+
+如果既没有调度任何序列，也没有发生抢占，说明引擎陷入了死循环。此时主动抛出异常，而不是让 `LLMEngine.generate()` 无限空转。
+
 ---
 
-### 5.3 后处理
+### 5.3 抢占（Preemption）
+
+**源码解析（`scheduler.py:144-150`）：**
+
+```python
+def preempt(self, seq):
+    self.block_manager.deallocate(seq)       # 释放所有 KV cache blocks
+    seq.status = SequenceStatus.WAITING      # 状态回退为 WAITING
+    self.waiting.appendleft(seq)             # 重新入队等待 prefill
+```
+
+当显存不足以容纳所有 running 序列时，调度器会抢占队尾的序列：释放其 KV cache，将其放回 waiting 队列。下次被调度时会重新 prefill（可能命中前缀缓存，减少重复计算）。
+
+---
+
+### 5.4 后处理
+
+**源码解析（`scheduler.py:155-179`）：**
+
+```python
+def postprocess(self, seqs, outputs):
+    for seq, token_id in zip(seqs, outputs):
+        seq.append_token(token_id)
+
+        # 三种停止条件
+        stop_due_to_eos = not seq.ignore_eos and token_id == self.eos
+        stop_due_to_max_tokens = seq.num_completion_tokens >= seq.max_tokens
+        stop_due_to_max_length = seq.max_model_length is not None and \
+                                 seq.num_tokens >= seq.max_model_length
+
+        if stop_due_to_eos or stop_due_to_max_tokens or stop_due_to_max_length:
+            seq.status = SequenceStatus.FINISHED
+            self.block_manager.deallocate(seq)   # 释放 KV cache
+            self.running.remove(seq)             # 移出 running 队列
+```
 
 **生成之后：**
-- 检查序列是否结束（EOS token 或达到最大长度）
+- 检查序列是否结束（EOS token / max_tokens / max_model_length）
 - 若结束：通过 BlockManager 释放 block
 - 将已完成序列从 running 队列移出
 
@@ -915,24 +1986,113 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 
 **目的：** 顶层 API，用于编排 scheduler、model runner 和请求处理。
 
+**源码架构（`llm_engine.py:25-63`）：**
+
+```python
+class LLMEngine:
+    def __init__(self, config):
+        world_size = config.get("world_size", 1)
+        ctx = mp.get_context("spawn")
+
+        # 1. 启动 worker 进程（rank 1, 2, ...）
+        for i in range(1, world_size):
+            event = ctx.Event()
+            process = ctx.Process(target=worker_process, args=(config, i, event))
+            process.start()
+
+        # 2. 初始化 rank 0 的 ModelRunner
+        self.model_runner = ModelRunner(config, rank=0, event=self.events)
+
+        # 3. 初始化 Scheduler（必须在 ModelRunner 之后！）
+        self.scheduler = Scheduler(...)
+
+        atexit.register(self.exit)
+```
+
+**多进程架构示意：**
+```
+┌─────────────────────────────────────────────────┐
+│  LLMEngine (rank 0, 主进程)                      │
+│  ├── ModelRunner (rank 0)                        │
+│  │   ├── model (GPU 0)                           │
+│  │   ├── KV cache (GPU 0)                        │
+│  │   └── CUDA graphs                             │
+│  ├── Scheduler                                   │
+│  │   ├── waiting queue                           │
+│  │   └── running queue                           │
+│  └── SharedMemory ──write──→ Event.set()          │
+└─────────────────────────────────────────────────┘
+         │ SharedMemory + Event
+         ▼
+┌─────────────────────────────────────────────────┐
+│  Worker Process (rank 1)                         │
+│  └── ModelRunner (rank 1)                        │
+│      ├── model (GPU 1)                           │
+│      ├── KV cache (GPU 1)                        │
+│      └── CUDA graphs                             │
+│  loop(): Event.wait() → read_shm() → call()      │
+└─────────────────────────────────────────────────┘
+```
 
 ### 6.1 核心方法
 
-**`add_request(prompt_str)`:**
-- 将 prompt 字符串 → 转换为 Sequence 对象
-- 加入 scheduler 的 waiting 队列
+**`add_prompt(prompt_str)`（`llm_engine.py:98-99`）：**
+```python
+def add_prompt(self, prompt, sampling_params):
+    self.scheduler.add_sequence(
+        Sequence(token_ids=self.tokenizer.encode(prompt),
+                 block_size=self.config['block_size'],
+                 sampling_params=sampling_params)
+    )
+```
 
-**`step()`:**
-- 调用 `scheduler.schedule()` 获取要运行的序列
-- 调用 `model_runner.run()` 执行
-- 更新序列状态
+**`step()`（`llm_engine.py:78-94`）：**
+```python
+def step(self):
+    # 1. 调度
+    scheduled_sequences, is_prefill = self.scheduler.schedule()
+    if not scheduled_sequences:
+        return [], 0, is_prefill
 
-**`generate(prompts)`:**
-- 推理主入口
-- 对每个 prompt：
-  1. 加入 scheduler
-  2. 反复调用 `step()` 直到完成
-  3. 打印生成速度统计
+    # 2. 执行（rank 0 写共享内存 → 所有 rank 同时执行 model forward）
+    outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
+
+    # 3. 后处理（追加 token、检查停止条件、释放 block）
+    self.scheduler.postprocess(scheduled_sequences, outputs)
+
+    # 4. 收集已完成的序列
+    outputs = [(seq.seq_id, seq.completion_token_ids)
+               for seq in scheduled_sequences if seq.is_finished]
+    return outputs, num_processed_tokens, is_prefill
+```
+
+**`generate(prompts)`（`llm_engine.py:105-122`）：**
+```python
+def generate(self, prompts, sampling_params):
+    for prompt in prompts:
+        self.add_prompt(prompt, sampling_params)
+
+    generated_tokens = {}
+    while not self.scheduler.is_finished():
+        outputs, num_processed_tokens, is_prefill = self.step()
+        generated_tokens.update({seq_id: tokens for seq_id, tokens in outputs})
+
+    # 按 seq_id 排序，恢复输入顺序
+    generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(...)]
+    return {'text': [self.tokenizer.decode(t) for t in generated_tokens],
+            'token_ids': generated_tokens}
+```
+
+**推理主循环流程：**
+```
+generate()
+  ├── add_prompt() × N          # 所有 prompt 入 waiting 队列
+  └── while not is_finished():
+        └── step()
+              ├── scheduler.schedule()     # 决定本步跑哪些序列
+              ├── model_runner.call("run") # 所有 rank 执行 forward
+              └── scheduler.postprocess()  # 追加 token / 检查停止 / 释放 block
+```
 
 ---
 
@@ -942,18 +2102,61 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 
 当 `world_size > 1` 时，`ModelRunner.__init__` 会调用 `dist.init_process_group('nccl', ...)`，这是一个**集合屏障（collective barrier）**——rank-0 会阻塞，直到所有 worker 进程也完成该调用后才继续执行。只有在所有 rank 都完成汇合后，`ModelRunner.__init__` 才会返回。Scheduler 在此之后创建，确保分布式环境完全就绪后引擎才进入可用状态。
 
+**初始化时序图（`llm_engine.py:26-63` + `model_runner.py:16-168`）：**
+
+```
+Rank 0 (主进程)                    Rank 1 (Worker)
+───────────────                    ───────────────
+spawn worker process ──────────→   worker_process() 启动
+                                     │
+ModelRunner.__init__()               ModelRunner.__init__()
+  dist.init_process_group() ────────── dist.init_process_group()
+  [barrier: 双方在此汇合]              [barrier: 双方在此汇合]
+  model.cuda(0)                      model.cuda(1)
+  load_weights()                     load_weights()
+  warmup_model()                     warmup_model()
+  allocate_kv_cache()                allocate_kv_cache()
+  all_reduce(MIN, max_blocks) ──────── all_reduce(MIN, max_blocks)
+  capture_cudagraph()                capture_cudagraph()
+  dist.barrier() ──────────────────── dist.barrier()
+  创建 SharedMemory                  等待 SharedMemory
+                                     │
+Scheduler.__init__()                 loop() 开始等待 Event
+```
+
 当 `world_size == 1` 时，不会启动任何 worker 进程，也不存在屏障，因此此时初始化顺序没有实际影响。
 
 ---
 
 ### 6.3 清理
 
-**为什么要 `exit()` 以及 `atexit.register(self.exit)`？**
+**源码解析（`llm_engine.py:68-72`）：**
+
 ```python
 def exit(self):
-    # Cleanup code
-    self.workers.join()  # Wait for workers to finish
+    self.model_runner.call("exit")     # 通知所有 rank 执行 exit
+    del self.model_runner
+    for process in self.processes:
+        process.join()                 # 等待 worker 进程退出
+```
 
+**ModelRunner.exit（`model_runner.py:193-204`）：**
+```python
+def exit(self):
+    if self.world_size > 1:
+        self.shm.close()
+        if self.rank == 0:
+            self.shm.unlink()          # 删除共享内存
+    if not self.enforce_eager:
+        del self.graphs                # 释放 CUDA graphs
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.destroy_process_group()   # 销毁进程组
+```
+
+**为什么要 `exit()` 以及 `atexit.register(self.exit)`？**
+
+```python
 atexit.register(self.exit)
 ```
 
@@ -961,6 +2164,36 @@ atexit.register(self.exit)
 1. 调用 `engine.exit()` 清理资源
 2. 等待 worker 进程优雅退出
 3. 防止出现僵尸进程或状态损坏
+
+---
+
+### 6.4 采样层（Sampler）
+
+具体实现：[sampler.py](src/myvllm/layers/sampler.py)
+
+**源码解析（`sampler.py:5-19`）：**
+
+```python
+class SamplerLayer(nn.Module):
+    @torch.compile
+    def forward(self, logits, temperature):
+        logits /= temperature.unsqueeze(-1)           # 温度缩放
+        probs = torch.softmax(logits, dim=-1)
+        # Gumbel-max 采样：等价于 multinomial 但更高效
+        sample_tokens = probs.div_(
+            torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)
+        ).argmax(dim=-1)
+        return sample_tokens
+```
+
+**Gumbel-max 技巧：** `probs / Exponential(1)` 再取 `argmax`，数学上等价于按 `probs` 分布做多项式采样，但避免了显式调用 `torch.multinomial`（后者在某些 CUDA 版本上有性能问题）。
+
+**为什么只有 rank 0 采样？** 在 `model_runner.py:444` 中：
+```python
+if self.rank == 0:
+    token_ids = self.sampler(logits, self.prepare_sample(seqs))
+```
+因为 `ParallelLMHead` 使用 `dist.gather` 将 logits 汇总到 rank 0，其他 rank 没有完整 logits，也不需要采样。
 
 ---
 
@@ -974,6 +2207,61 @@ atexit.register(self.exit)
 6. **LLM Engine**（顶层编排）
 
 每一步都建立在前一步之上，逐步构建一个完整的推理系统，并加入诸如 PagedAttention、CUDA graphs 与 prefix caching 等高级优化。
+
+---
+
+## 附录：完整数据流
+
+**一次 `step()` 的完整数据流（以 decode 为例）：**
+
+```
+LLMEngine.step()
+  │
+  ├── Scheduler.schedule()
+  │     ├── 从 running 队列取出序列
+  │     ├── BlockManager.can_append() → 检查显存
+  │     └── BlockManager.append() → 分配新 block（如需要）
+  │
+  ├── ModelRunner.call("run", seqs, is_prefill=False)
+  │     │
+  │     ├── [rank 0] write_shm() → 通知 worker
+  │     │
+  │     ├── [所有 rank] prepare_decode()
+  │     │     ├── input_ids = [last_token_0, last_token_1, ...]
+  │     │     ├── slot_mapping = [block*bs+offset, ...]
+  │     │     ├── context_lens = [len(seq_0), len(seq_1), ...]
+  │     │     ├── block_tables = [[b0, b1, ...], [-1, -1, ...], ...]
+  │     │     └── set_context(is_prefill=False, ...)
+  │     │
+  │     ├── [所有 rank] run_model()
+  │     │     ├── 拷贝数据到 graph buffer
+  │     │     ├── graph.replay()
+  │     │     │     ├── embed_tokens(input_ids)
+  │     │     │     ├── for layer in layers:
+  │     │     │     │     ├── LayerNorm(x, residual)
+  │     │     │     │     ├── QKVColumnParallel(x) → q, k, v
+  │     │     │     │     ├── q_norm(q), k_norm(k)
+  │     │     │     │     ├── RotaryEmbedding(positions, q, k)
+  │     │     │     │     ├── Attention(q, k, v)
+  │     │     │     │     │     ├── store_kvcache(k, v, slot_mapping)
+  │     │     │     │     │     └── paged_attention_decode(q, k_cache, v_cache, block_tables)
+  │     │     │     │     ├── RowParallel(o) → all_reduce
+  │     │     │     │     ├── LayerNorm(x, residual)
+  │     │     │     │     └── MLP(x) → gate_up → SiluAndMul → down_proj → all_reduce
+  │     │     │     └── compute_logits(hidden_states)
+  │     │     │           └── ParallelLMHead → gather to rank 0
+  │     │     └── return logits
+  │     │
+  │     ├── [rank 0] SamplerLayer(logits, temperature)
+  │     │     └── Gumbel-max → token_ids
+  │     │
+  │     └── reset_context()
+  │
+  └── Scheduler.postprocess(seqs, token_ids)
+        ├── seq.append_token(token_id)
+        ├── 检查停止条件（EOS / max_tokens / max_length）
+        └── 若完成：BlockManager.deallocate(seq)
+```
 
 ## 课程练习
 
