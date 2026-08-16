@@ -37,19 +37,29 @@ class LLMEngine:
             process.start()
         # start the engine only on the master thread with rank = 0
         self.model_runner = ModelRunner(config, rank=0, event=self.events)
+        # runner_type:"generation"(因果 LM,默认) | "pooling"(embedding,纯 prefill)
+        self.runner_type = config.get("runner_type", "generation")
         self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"))
-        
-        # scheduler needs to init after model_runner: when world_size > 1,
-        # ModelRunner.__init__ calls dist.init_process_group() which is a
-        # collective barrier — rank-0 blocks until all worker ranks have joined.
-        # The scheduler should only be created after that rendezvous completes.
-        # When world_size == 1 there is no barrier and no real dependency.
+        # VL/pooling 路径用 AutoProcessor(chat template + <|image_pad|> 插入 + 像素抽取)
+        self.processor = None
+        if self.runner_type == "pooling":
+            from transformers import AutoProcessor
+            self.processor = AutoProcessor.from_pretrained(config.get("model_name_or_path"))
+
+        # scheduler 需在 model_runner 之后初始化:world_size>1 时 ModelRunner.__init__
+        # 调 dist.init_process_group() 这是个 collective barrier —— rank-0 会阻塞到所有
+        # worker rank 都加入。scheduler 应在此 rendezvous 完成后创建。
+        # world_size==1 时无 barrier,无真实依赖。
+        # pooling 模式额外传 max_image_patches(vision tower 的 OOM 守卫预算)
+        mm = config.get("multimodal", {})
         self.scheduler = Scheduler(
             max_num_sequences=config.get("max_num_sequences", 16),
             max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
             max_cached_blocks=config.get("max_cached_blocks", 1024),
             block_size=config.get("block_size", 256),
-            eos=config.get("eos", 50256)
+            eos=config.get("eos", 50256),
+            runner_type=self.runner_type,
+            max_image_patches=mm.get("max_image_patches", None),
         )
 
         atexit.register(self.exit)
@@ -110,3 +120,55 @@ class LLMEngine:
         generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]
         output = {'text': [self.tokenizer.decode(tokens) for tokens in generated_tokens], 'token_ids': generated_tokens}
         return output
+
+    # ---- pooling / embedding path (VL) ----
+
+    def _add_input(self, item: dict, instruction: str, seq_id_counter):
+        """把一条 {text,image} 请求经 AutoProcessor 转成 Sequence(带 mm_data)入队。
+        build_multimodal_inputs 产出 input_ids + mm_token_type_ids + pixel_values +
+        image_grid_thw + image_token_spans,挂到 Sequence.mm_data。"""
+        from myvllm.models.qwen3_vl import build_multimodal_inputs, MultimodalData
+        built = build_multimodal_inputs(self.processor, instruction, item)
+        token_ids = built["input_ids"].tolist()
+        seq = Sequence(token_ids=token_ids, block_size=self.config['block_size'])
+        seq.mm_data = MultimodalData(
+            pixel_values=built["pixel_values"],
+            grid_thw=built["grid_thw"],
+            token_types=built["token_types"],
+            image_token_spans=built["image_token_spans"],
+        )
+        self.scheduler.add_sequence(seq)
+        return seq.seq_id
+
+    def encode(self, inputs: list[dict], pooling: dict | None = None) -> list:
+        """把 文本/图像/图像+文本 输入编码为归一化向量。
+
+        每条 item:{"text": str} | {"image": 路径} | {"text": str, "image": 路径},
+        可选 per-item "instruction"(默认 "Represent the user's input.",instruction-aware)。
+        返回按输入顺序的 (embed_dim,) CPU 张量列表。
+
+        流程:逐条 _add_input 入 waiting → 循环 schedule()+run() 直到全部完成 →
+        按输入顺序收集 embedding。Scheduler 自动按 token/image-patch 预算分批 prefill。"""
+        if self.runner_type != "pooling":
+            raise RuntimeError("encode() requires runner_type='pooling'")
+        default_instr = self.config.get("pooling", {}).get(
+            "instruction", "Represent the user's input.")
+        ids = []
+        for item in inputs:
+            instr = item.get("instruction", default_instr)
+            ids.append(self._add_input(item, instr, Sequence.counter))
+
+        embeddings = {}
+        while not self.scheduler.is_finished():
+            seqs, is_prefill = self.scheduler.schedule()
+            if not seqs:
+                break  # 无 waiting 即完成
+            # run() 在 pooling 模式返回 (num_seqs, dim) embedding(rank 0)
+            emb = self.model_runner.call("run", seqs, True)
+            self.scheduler.postprocess(seqs, emb)  # 标记 FINISHED、移出 running
+            if emb is not None:
+                emb_cpu = emb.detach().cpu()
+                for seq, e in zip(seqs, emb_cpu):
+                    embeddings[seq.seq_id] = e
+        # 恢复输入顺序(schedule 分批会打乱,但 seq_id 唯一,按 ids 顺序取)
+        return [embeddings[i] for i in ids]

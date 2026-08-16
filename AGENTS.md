@@ -110,6 +110,36 @@ is one scheduler iteration.
   `'Llama-3.2-1B-Instruct'` are accepted; anything else raises. Adding a model
   means adding a `case` branch (and a file under `models/`).
 
+## Pooling mode (Qwen3-VL-Embedding, prefill-only)
+
+Opt-in via `config["runner_type"] = "pooling"`. Mirrors vLLM's `RunnerType` seam:
+the prefill engine core (flash varlen attention, TP linears) is reused; the
+decode-only machinery is gated behind `runner_type == "generation"`.
+
+- **Skipped in pooling**: KV cache allocation (`model_runner.py` `allocate_kv_cache`),
+  CUDA graph capture (`capture_cudagraph`), the scheduler decode branch + `preempt()`,
+  token sampling. `LLMEngine.encode()` replaces `generate()`.
+- **New subpackages**: `vision/` (ViT tower, replicated), `multimodal/` (image
+  preprocessing + MRoPE positions via `compute_mrope_positions`), `pooling/`
+  (`EmbeddingHead`: last-token gather + L2 + MRL, no projection — R-1 confirmed).
+- **MRoPE**: `layers/rotary_embedding.py` `MRotaryEmbedding` — 3D positions (T/H/W),
+  interleaved layout `[T0,H0,W0,...,T19,H19,W19,T20..T23]` per `mrope_section=[24,20,20]`;
+  reuses the existing GPT-J `apply_rotary_pos_emb` (equivalent to transformers
+  rotate-half). ViT uses `VisionRotaryEmbedding` (theta=10000, non-interleaved).
+- **Flash kernel non-causal**: `flash_attention_varlen_kernel` gained an
+  `IS_CAUSAL` constexpr; ViT bidirectional attention calls it with `is_causal=False`.
+- **Deepstack**: visual features extracted at ViT layers `[5,11,17]`, injected at
+  **text decoder layers `[0,1,2]`** at image-token positions (per transformers source).
+- **TP**: ViT/DeepstackProj/EmbeddingHead replicated; text decoder sharded via the
+  existing TP linears. **VL loader** (`utils/loader_vl.py`) calls per-param
+  `weight_loader` (correct `tp_rank` slice) instead of bypassing it like the
+  generation loader does. The generation loader's TP>1 bypass-bug (R-7) is NOT
+  fixed by this change — VL only.
+- Entry: `main_embedding.py`; per-input `{"text"}`, `{"image"}`, or `{"text","image"}`,
+  optional `"instruction"` (default `Represent the user's input.`).
+- **Windows caveat**: `vllm>=0.15.0` is Linux-only and blocks `uv sync` on Windows;
+  run/test on a Linux GPU host (the rented AutoDL box).
+
 ## Conventions
 
 - **Imports:** models use `from myvllm.layers import *` (wildcard re-export from

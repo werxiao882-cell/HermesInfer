@@ -36,6 +36,9 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.max_model_length = sampling_params.max_model_length
+        # 多模态载荷(pooling/VL 路径);文本生成为 None。含 pixel_values/grid_thw/
+        # token_types/image_token_spans,由 _prepare_prefill_vl 消费。
+        self.mm_data = None
 
     def __len__(self):
         return self.num_tokens
@@ -86,12 +89,16 @@ class Sequence:
         self.num_tokens += 1 
 
     def __getstate__(self):
+        # 跨进程序列化(USP/TP 多卡时 rank0→worker 的共享内存 RPC)。
+        # 原实现只传 token_ids(prefill)或 last_token(decode)以省带宽;新增 mm_data
+        # 字段一起带上(prefill 时多模态数据必须到 worker)。decode 时 mm_data=None。
         return (
-            self.num_tokens, 
-            self.num_prompt_tokens, 
-            self.num_cached_tokens, 
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
             self.block_table,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token
+            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+            getattr(self, "mm_data", None),
         )
 
     def __setstate__(self, state):
@@ -100,15 +107,21 @@ class Sequence:
             self.num_prompt_tokens,
             self.num_cached_tokens,
             self.block_table,
-            last_token_or_ids
+            last_token_or_ids,
+            mm_data,
         ) = state
-        # Check if this is prefill (num_completion_tokens == 0) or decode phase
+        # 判断 prefill(num_completion_tokens==0)还是 decode
         num_completion_tokens = self.num_tokens - self.num_prompt_tokens
         if num_completion_tokens == 0:
-            # Prefill: last_token_or_ids is the full token_ids list
+            # Prefill:last_token_or_ids 是完整 token_ids 列表
             self.token_ids = last_token_or_ids
         else:
-            # Decode: last_token_or_ids is just the last token
+            # Decode:last_token_or_ids 只是最后一个 token
             self.token_ids = [last_token_or_ids]
-        # Restore last_token attribute
+        # 恢复 last_token 属性
         self.last_token = self.token_ids[-1] if self.token_ids else None
+        self.mm_data = mm_data
+        # __getstate__ 不带的属性(decode 路径不需要,但恢复以防属性访问报错):
+        # seq_id/status 给默认,temperature 等由调用方在 rank0 处理(worker 不采样)。
+        self.seq_id = -1
+        self.status = SequenceStatus.RUNNING

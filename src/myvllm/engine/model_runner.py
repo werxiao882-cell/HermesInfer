@@ -21,6 +21,9 @@ class ModelRunner:
         self.block_size = config['block_size']
         self.world_size = config['world_size']
         self.enforce_eager = config.get('enforce_eager', False)
+        # runner_type:"generation"(因果 LM,默认) | "pooling"(embedding,纯 prefill)
+        # 决定是否走 KV cache / CUDA graph / 采样,以及用哪条加载器。
+        self.runner_type = config.get('runner_type', 'generation')
 
         self.rank = rank
         dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
@@ -65,6 +68,40 @@ class ModelRunner:
                     block_size=self.block_size,
                     tie_word_embeddings=config['tie_word_embeddings'],
                 )
+            case 'Qwen3-VL-Embedding-2B':
+                # 构建 VL embedding 模型:复制 vision tower + TP 分片 28 层文本 decoder
+                # + 复制 EmbeddingHead。配置默认值对齐 Qwen3-VL-Embedding-2B 的 config.json
+                # (dim 2048 / heads 16 / kv 8 / layers 28 / mrope [24,20,20] / deepstack [5,11,17])。
+                from myvllm.models.qwen3_vl import Qwen3VLForEmbedding
+                pcfg = config.get('pooling', {})
+                self.model = Qwen3VLForEmbedding(
+                    vocab_size=config.get('vocab_size', 151936),
+                    hidden_size=config.get('hidden_size', 2048),
+                    num_heads=config.get('num_heads', 16),
+                    head_dim=config.get('head_dim', 128),
+                    num_kv_heads=config.get('num_kv_heads', 8),
+                    intermediate_size=config.get('intermediate_size', 6144),
+                    num_layers=config.get('num_layers', 28),
+                    rms_norm_epsilon=config.get('rms_norm_epsilon', 1e-6),
+                    base=config.get('base', 5_000_000),
+                    mrope_section=config.get('mrope_section', [24, 20, 20]),
+                    block_size=self.block_size,
+                    tie_word_embeddings=config.get('tie_word_embeddings', True),
+                    vision_depth=config.get('vision_depth', 24),
+                    vision_hidden_size=config.get('vision_hidden_size', 1024),
+                    vision_intermediate_size=config.get('vision_intermediate_size', 4096),
+                    vision_num_heads=config.get('vision_num_heads', 16),
+                    patch_size=config.get('patch_size', 16),
+                    temporal_patch_size=config.get('temporal_patch_size', 2),
+                    in_channels=config.get('in_channels', 3),
+                    out_hidden_size=config.get('out_hidden_size', 2048),
+                    spatial_merge_size=config.get('spatial_merge_size', 2),
+                    num_position_embeddings=config.get('num_position_embeddings', 2304),
+                    deepstack_visual_indexes=config.get('deepstack_visual_indexes', [5, 11, 17]),
+                    pooling_mode=pcfg.get('mode', 'last_token'),
+                    normalize=pcfg.get('normalize', True),
+                    mrl_dim=pcfg.get('mrl_dim', None),
+                )
             case _:
                 raise Exception(f"Unsupported model: {config['model_name_or_path']}")
 
@@ -73,8 +110,14 @@ class ModelRunner:
 
         # Load pretrained weights if model_name_or_path is provided
         if config.get('model_name_or_path'):
-            from myvllm.utils.loader import load_weights_from_checkpoint
-            load_weights_from_checkpoint(self.model, config['model_name_or_path'])
+            if self.runner_type == 'pooling':
+                # VL 走 TP-aware 加载器:调 per-param weight_loader 按 tp_rank 正确切头
+                # (修 R-7,生成路径不动)。复制部分(vision/deepstack/EmbeddingHead)全量。
+                from myvllm.utils.loader_vl import load_weights_vl
+                load_weights_vl(self.model, config['model_name_or_path'])
+            else:
+                from myvllm.utils.loader import load_weights_from_checkpoint
+                load_weights_from_checkpoint(self.model, config['model_name_or_path'])
 
         # Load weights in CPU (move the model to GPU after loading weights)
         # self.model = self.model.cuda(rank)
@@ -88,12 +131,16 @@ class ModelRunner:
         self._first_decode = False
 
         # warm up model so that we know peak memory usage
-        self.warmup_model()
         # allocate kv cache
-        self.allocate_kv_cache()
         # capture cuda graph for decoding
-        if not self.enforce_eager:
-            self.capture_cudagraph()
+        # 这三者都是生成路径(decode KV cache、图重放)的关切;pooling 是纯 prefill,
+        # 无 decode/KV cache/CUDA graph,故整体跳过,把显存让给 vision 激活。
+        # 若不跳过,warmup_model 的文本形 forward 与 allocate_kv_cache 会报错/浪费。
+        if self.runner_type == 'generation':
+            self.warmup_model()
+            self.allocate_kv_cache()
+            if not self.enforce_eager:
+                self.capture_cudagraph()
 
         torch.set_default_device(f'cuda:{rank}')
         torch.set_default_dtype(self.default_dtype)
@@ -384,6 +431,9 @@ class ModelRunner:
     # sample logits
     # reset context
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        # pooling 模式直接走 _run_pooling(无 decode、无采样、无 cuda graph)
+        if self.runner_type == 'pooling':
+            return self._run_pooling(seqs)
         if is_prefill:
             input_ids = self.prepare_prefill(seqs)
         else:
@@ -395,6 +445,123 @@ class ModelRunner:
             token_ids = self.sampler(logits, self.prepare_sample(seqs))
         reset_context()
         return token_ids
+
+    @torch.inference_mode()
+    def _run_pooling(self, seqs: list[Sequence]):
+        """Pooling(embedding)执行路径:纯 prefill,跑 vision tower + VL 文本 decoder
+        + pooling head,返回 (num_seqs, embed_dim)。无 KV cache、无 CUDA graph、无采样。
+        与生成路径 run() 对应,但绕开 decode/cuda graph/sampler(那些在 __init__ 里
+        runner_type=='pooling' 时已整体跳过分配)。"""
+        input_ids, vl_inputs = self._prepare_prefill_vl(seqs)
+        # 模型 forward 自己跑 vision tower(复制)+ TP 分片文本 decoder + EmbeddingHead
+        emb = self.model(input_ids, **vl_inputs)
+        reset_context()
+        # EmbeddingHead 复制(残差流在每 rank 都是 full),故每 rank 产出相同 embedding;
+        # 仅 rank 0 返回(对标生成路径的 rank-0 采样约定,见 run())。
+        return emb if self.rank == 0 else None
+
+    def _prepare_prefill_vl(self, seqs: list[Sequence]):
+        """构造一次 pooling prefill 的全部输入。步骤:
+        1) 打包 input_ids + cu_seqlens_q(无前缀缓存,pooling 不复用 KV)
+        2) 收集每条序列的 mm_data + MRoPE 位置输入(token_types、image_grids)
+        3) compute_mrope_positions 算 (3, total_tokens) 的 T/H/W 位置
+        4) 拼批级 pixel_values/grid_thw,并把每图 image_token_spans 加偏移映射进 packed 序列
+        5) 构造 image_token_mask(图像 token 的 bool 掩码,供 deepstack scatter)
+        6) set_context(slot_mapping=None 让 Attention 跳过 KV 存储;positions_3d/image_token_mask 入 context)
+        返回 (input_ids_tensor, {pixel_values, grid_thw, image_token_spans, cu_seqlens_q})。"""
+        from myvllm.models.qwen3_vl import compute_mrope_positions
+        # ---- 1) 打包 input_ids + cu_seqlens_q,顺带收 mm_data ----
+        input_ids = []
+        cu_seqlens_q = [0]
+        per_seq_mm = []
+        per_seq_pos_inputs = []
+        sms = self.config.get('spatial_merge_size', 2)
+        for seq in seqs:
+            ids = seq.token_ids
+            input_ids.extend(ids)
+            cu_seqlens_q.append(cu_seqlens_q[-1] + len(ids))
+            mm = getattr(seq, "mm_data", None)
+            per_seq_mm.append(mm)
+            # 给 compute_mrope_positions 准备每条序列的输入
+            if mm is not None and mm.token_types is not None:
+                per_seq_pos_inputs.append({
+                    "input_ids": torch.tensor(ids, device='cpu', dtype=torch.long),
+                    "token_types": mm.token_types.to('cpu'),
+                    "image_grids": [tuple(int(x) for x in g) for g in mm.grid_thw.tolist()] if mm.grid_thw is not None else [],
+                })
+            else:
+                # 纯文本:token_types 全 0(文本),无 image_grids
+                per_seq_pos_inputs.append({
+                    "input_ids": torch.tensor(ids, device='cpu', dtype=torch.long),
+                    "token_types": torch.zeros(len(ids), dtype=torch.int),
+                    "image_grids": [],
+                })
+
+        # ---- 2) MRoPE 3D 位置(T/H/W)按批打包,每条序列 current_pos 从 0 起 ----
+        # VL 模型始终用 MRoPE:文本 token 三轴 T=H=W=arange(_positions_single 处理),
+        # 图像 token 从 patch 网格派生。故即便纯文本批也要算 positions_3d —— 之前用
+        # `if any(image_grids)` 守卫会让纯文本请求 positions_3d=None,模型 forward 无条件
+        # 调 rotary → NoneType 下标崩溃(README 明确支持纯文本 query,必修)。
+        positions_3d = compute_mrope_positions(per_seq_pos_inputs, spatial_merge_size=sms)
+        positions_3d = positions_3d.cuda(self.rank)
+
+        # ---- 3) vision tower 输入:批级拼 pixel_values/grid_thw,并把每图 spans 加偏移 ----
+        # 注意:vision tower 由 model.forward 自己跑(复制),这里只收集输入;
+        # image_token_spans 需从"每序列局部坐标"转成"packed 批全局坐标"。
+        pixel_values = None
+        grid_thw = None
+        image_token_spans = []
+        has_image = any(m is not None and m.has_image for m in per_seq_mm)
+        if has_image:
+            pv_list, gt_list = [], []
+            offset = 0  # 当前序列在 packed input_ids 里的起点
+            for seq, mm in zip(seqs, per_seq_mm):
+                ids_len = len(seq.token_ids)
+                if mm is not None and mm.has_image:
+                    pv_list.append(mm.pixel_values)
+                    gt_list.append(mm.grid_thw)
+                    # 把该序列的 (s,e) 加 offset 变全局坐标
+                    for (s, e) in mm.image_token_spans:
+                        image_token_spans.append((offset + s, offset + e))
+                offset += ids_len
+            pixel_values = torch.cat(pv_list, dim=0).cuda(self.rank)
+            grid_thw = torch.cat(gt_list, dim=0).cuda(self.rank)
+
+        # ---- 4) image_token_mask(total_tokens 的 bool),供 deepstack 在图像 token 位置 scatter ----
+        total = len(input_ids)
+        if image_token_spans:
+            mask = torch.zeros(total, dtype=torch.bool)
+            for (s, e) in image_token_spans:
+                mask[s:e] = True
+            image_token_mask = mask.cuda(self.rank)
+        else:
+            image_token_mask = None
+
+        # ---- 5) set_context:slot_mapping=None → Attention 跳过 KV 存(polling 无 cache);
+        #        positions_3d / image_token_mask 经 context 单例传给模型与 attention ----
+        cu_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(
+            is_prefill=True,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_q,           # pooling 下 Q=K(同一序列),用同一组 cu_seqlens
+            max_seqlen_q=max(cu_seqlens_q[i+1]-cu_seqlens_q[i] for i in range(len(cu_seqlens_q)-1)),
+            max_seqlen_k=0,
+            slot_mapping=None,           # 关键:让 Attention.forward 跳过 store_kvcache 分支
+            context_lens=None,
+            block_tables=None,
+            positions_3d=positions_3d,
+            image_token_mask=image_token_mask,
+            runner_type='pooling',
+        )
+
+        input_ids_t = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        # 这些会作为 model.forward 的关键字参数(pixel_values/grid_thw/image_token_spans/cu_seqlens_q)
+        return input_ids_t, {
+            "pixel_values": pixel_values,
+            "grid_thw": grid_thw,
+            "image_token_spans": image_token_spans,
+            "cu_seqlens_q": cu_q,
+        }
 
     # capture the CUDA graph:
     # pre-allocation at maximum sizes: allocated onece and reuse for all graphs

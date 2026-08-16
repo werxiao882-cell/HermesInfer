@@ -118,10 +118,16 @@ def flash_attention_varlen_kernel(
     head_dim: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
 ):
-    """
-    Flash Attention kernel for variable-length sequences.
-    Each program processes one block of queries for one head in one sequence.
+    """变长序列的 Flash Attention 内核。每个 program 处理"某序列里某头的一块 query"。
+
+    IS_CAUSAL(constexpr):
+      - True(LLM prefill):在序列内施加因果 mask(query 只能 attend 到自身及之前
+        的 key),对应文本生成的因果注意力。
+      - False(ViT prefill):双向,query attend 序列内全部 key,对应视觉塔的全
+        patch 自注意力。Qwen3-VL 文本 decoder 用 True,vision tower 用 False。
+      新增此开关是为 R-3:原内核硬编码因果 mask(offs_m >= offs_n),ViT 不能用。
     """
     # Program IDs
     start_m = tl.program_id(0) # block index
@@ -177,9 +183,14 @@ def flash_attention_varlen_kernel(
         qk = tl.dot(q, k)
         qk = qk * scale
         
-        # Apply causal mask: only attend to positions <= current position
-        mask_causal = (offs_m[:, None] + seq_start) >= (offs_n[None, :] + seq_start)
-        qk = tl.where(mask_causal & mask_n[None, :], qk, -1e10)
+        # 仅当 IS_CAUSAL(LLM prefill)才施加序列内因果 mask;ViT prefill 双向不施加。
+        # 原实现硬编码 mask_causal = (offs_m+seq_start) >= (offs_n+seq_start),两端
+        # 都 +seq_start 等价于 offs_m >= offs_n。双向分支只保留有效位置 mask_n。
+        if IS_CAUSAL:
+            mask_causal = (offs_m[:, None] + seq_start) >= (offs_n[None, :] + seq_start)
+            qk = tl.where(mask_causal & mask_n[None, :], qk, -1e10)
+        else:
+            qk = tl.where(mask_n[None, :], qk, -1e10)
         
         # Online softmax update
         m_ij = tl.max(qk, axis=1)
@@ -218,17 +229,18 @@ def flash_attention_prefill(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    is_causal: bool = True,
 ) -> torch.Tensor:
     """
-    Optimized Flash Attention for prefill phase with variable-length sequences.
-    
+    变长序列 prefill 的 Flash Attention。
+
     Args:
         q: (total_tokens, num_heads, head_dim)
         k: (total_tokens, num_kv_heads, head_dim)
         v: (total_tokens, num_kv_heads, head_dim)
-        cu_seqlens: cumulative sequence lengths
-        scale: attention scale factor
-    
+        cu_seqlens: 累积序列长度(划分各序列边界,序列内部不再额外切分)
+        scale: 注意力缩放因子
+        is_causal: True 施加因果 mask(LLM prefill);False 双向(ViT prefill)
     Returns:
         output: (total_tokens, num_heads, head_dim)
     """
@@ -275,6 +287,7 @@ def flash_attention_prefill(
         head_dim=head_dim,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        IS_CAUSAL=is_causal,
     )
     
     return output
@@ -460,6 +473,9 @@ class Attention(nn.Module):
         scale: float = 1.0,
         num_kv_heads: int = None,
         block_size: int = 16,
+        # is_causal:文本 decoder 用 True(因果 LLM prefill),ViT 用 False(双向)。
+        # 由 Attention 实例在构造时决定,forward 里透传给 flash_attention_prefill。
+        is_causal: bool = True,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -467,13 +483,14 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.block_size = block_size
+        self.is_causal = is_causal
         self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
 
-        # Store current k, v into cache if cache is allocated
+        # Store current k, v into cache if cache is allocated (decode path; ViT/pooling skip)
         if k_cache.numel() > 0 and v_cache.numel() > 0 and context.slot_mapping is not None:
             # Ensure k, v are in the right shape: (num_tokens, num_kv_heads, head_dim)
             if k.dim() == 4:
@@ -491,14 +508,14 @@ class Attention(nn.Module):
         scale = self.scale / (self.head_dim ** 0.5)
 
         if context.is_prefill:
-            # Prefill: use flash attention
-            # Varlen mode: (total_tokens, num_heads, head_dim)
+            # Prefill:用 flash attention。Varlen 模式 (total_tokens, num_heads, head_dim)
             cu_seqlens = context.cu_seqlens_q
             if cu_seqlens is None:
                 raise ValueError("cu_seqlens_q must be provided for varlen attention")
-            
-            o = flash_attention_prefill(q, k, v, cu_seqlens, scale, 
-                                        self.num_heads, self.num_kv_heads, self.head_dim)
+            # 透传 self.is_causal:LLM 文本 True(因果),ViT False(双向)
+            o = flash_attention_prefill(q, k, v, cu_seqlens, scale,
+                                        self.num_heads, self.num_kv_heads, self.head_dim,
+                                        is_causal=self.is_causal)
             # Output: (total_tokens, num_heads, head_dim) -> (total_tokens, num_heads * head_dim)
             return o.reshape(o.shape[0], self.num_heads * self.head_dim)
         else:
