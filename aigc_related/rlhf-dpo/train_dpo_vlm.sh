@@ -1,0 +1,13 @@
+accelerate launch train_dpo_vlm.py \
+    --dataset_name HuggingFaceH4/rlaif-v_formatted \
+    --model_name_or_path /home/lixin/workspace/checkpoint_space/Qwen2.5-VL-3B-Instruct \
+    --per_device_train_batch_size 4 \
+    --gradient_accumulation_steps 2 \
+    --dataset_num_proc 32 \
+    --output_dir dpo_idefics_rlaif-v \
+    --dtype bfloat16 \
+    --gradient_checkpointing \
+    --use_peft \
+    --lora_target_modules all-linear\
+    --report_to wandb\
+    --run_name "vlm_dpo_test" \
