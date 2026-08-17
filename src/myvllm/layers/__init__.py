@@ -5,3 +5,4 @@ from .layernorm import LayerNorm
 from .linear import *
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding, VisionRotaryEmbedding
 from .sampler import SamplerLayer
+from .video_rope import VideoRotaryEmbedding
