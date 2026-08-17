@@ -29,7 +29,7 @@
 ## 改动内容
 
 ### 新增子包
-- `src/myvllm/diffusion/` —— Wan2.1 DiT 模型、3D VAE、流匹配调度器、T2V/I2V pipeline。
+- `src/myvllm/diffusion/` —— Wan2.1 DiT 模型、VAE 封装(复用 diffusers `AutoencoderKLWan`)、流匹配调度器、T2V/I2V pipeline。
 - `src/myvllm/usp/` —— Ulysses 序列并行:基于 `dist.all_to_all` 的注意力转置层
   (sequence↔heads),供 DiT 自注意力使用;FSDP 兼容的权重分片辅助。
 
@@ -65,7 +65,7 @@
 - **受影响模块**:`layers/`(新增 usp_attention、3D RoPE)、新增 `diffusion/`、`usp/`、
   `models/wan.py`、`utils/loader.py`、`utils/context.py`(扩散 context 字段)。
 - **向后兼容**:文本生成 / embedding 路径行为不变;`runner_type` 新增 `"diffusion"`。
-- **依赖**:新增 `diffusers`(仅借用其 VAE/调度器参考实现,可改为自研)、`transformers`
+- **依赖**:新增 `diffusers`(VAE 直接复用 `AutoencoderKLWan`,调度器参考实现)、`transformers`
   (T5/CLIP 文本与图像编码器)、`imageio`/`torchvision`(视频 IO)、`einops`。`flash-attn`
   可选(USP 路径用自研 Triton)。
 - **硬件**:CUDA-only;USP 要求 `world_size ≤ num_heads`(14B:40 头,实际 ≤8;

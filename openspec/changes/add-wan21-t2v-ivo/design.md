@@ -137,7 +137,7 @@ latent(16ch)沿通道拼成 36ch;额外 CLIP 图像 pooled 特征做一次 cross
 | `__init__.py` | 重导出 `WanDiT`、`WanVAE`、`FlowScheduler`、`T2VPipeline`、`I2VPipeline` |
 | `dit.py` | `WanDiT`:patch embed、timestep emb、N 层 `WanDiTBlock`、unpatchify;按 config 构 1.3B/14B |
 | `block.py` | `WanDiTBlock`:adaLN 调制 + USP self-attn + cross-attn + MLP(R-1 核对调制) |
-| `vae.py` | `WanVAE`:3D 因果 VAE encode/decode,空间 8×、时间 4× 下采样,16 通道 |
+| `vae.py` | `WanVAE`:封装 diffusers `AutoencoderKLWan`,提供 `encode`/`decode` 接口;v1 不自研 3D 因果 VAE(R-3) |
 | `scheduler.py` | `FlowScheduler`:rectified flow,shifted,1→0,可配步数;`step(z_t, v, t)` |
 | `pipeline.py` | `T2VPipeline`/`I2VPipeline`:文本/图像编码 → 采样循环 → VAE decode → 视频 |
 | `patch_embed.py` | `PatchEmbed3D`:`(1,2,2)` patchify + unpatchify |
@@ -149,7 +149,7 @@ latent(16ch)沿通道拼成 36ch;额外 CLIP 图像 pooled 特征做一次 cross
 | `__init__.py` | 重导出 `USPAttention`、`usp_group()`、`all_to_all_seq2head`/`head2seq` |
 | `ulysses.py` | `all_to_all_seq2head(x)` / `head2seq(x)`:基于 `dist.all_to_all` 的转置;校验 `num_heads % P == 0` |
 | `usp_attention.py` | `USPAttention`:forward 做 seq2head → flash(non-causal, varlen)→ head2seq;支持 3D RoPE |
-| `group.py` | `init_usp_group(world_size, rank)`:新建 NCCL 组(不与 TP 组共用,避免 all_reduce 干扰) |
+| `group.py` | `init_usp_group(world_size, rank, port=12346)`:新建 NCCL 组(不与 TP 组共用,避免 all_reduce 干扰);使用独立端口(R-7) |
 
 ### 3.3 层扩展
 
@@ -232,7 +232,7 @@ class DiffusionEngine:
 | DiT cross-attn | **复制**(全文本,文本 512 短) | 通信不划算 |
 | DiT MLP / adaLN / norm | **USP 序列分片**(逐 token,无通信) | MLP 逐 token,序列分片即逐 token 分片 |
 | timestep emb / text emb / image pooled | **复制** | 标量/短序列 |
-| VAE encode/decode | rank0 解码后 all-gather(或每 rank 解码本地时空分片) | VAE 非 DiT,不复用 USP |
+| VAE encode/decode | **v1:rank0 跑 diffusers `AutoencoderKLWan` 后 broadcast latent;decode 同理**(R-3) | VAE 非 DiT,3D 因果卷积复杂,不自研 |
 | 文本/图像编码器 | rank0 跑 → broadcast | 一次性,小开销 |
 
 ## 5. 长序列策略(分层)
@@ -267,14 +267,24 @@ class DiffusionEngine:
 - **R-2 —— USP 权重按 head 分发**。加载器需把 q/k/v/o 的 `num_heads` 维按 `head_idx % P`
   切到对应 rank。若权重布局是 `[3, num_heads, head_dim, dim]`(QKV 合并)则按 head 切第 1 维;
   需核对 checkpoint 的实际权重名与布局。
-- **R-3 —— VAE 的 USP 兼容**。3D 因果 VAE 的 encode/decode 在时间轴有因果依赖,不能简单
-  按时间切片并行;v1 让 rank0 跑 VAE 再 broadcast latent(简单但非并行),v2 再做时空分片。
+- **R-3 —— VAE 实现策略调整**。3D 因果 VAE 的 encode/decode 在时间轴有因果依赖,不能简单
+  按时间切片并行。**v1 决策:不自研 VAE,直接复用 diffusers 的 `AutoencoderKLWan` 实现**。
+  理由:3D 因果卷积涉及时间轴因果 padding、分组归一化等复杂细节,自研成本高且非项目核心价值
+  (项目核心是 Triton 内核 + USP 并行栈)。VAE 仅在采样首尾各跑一次,不是性能瓶颈。v1 让 rank0
+  跑 VAE encode/decode 再 broadcast/gather latent(简单但非并行),v2 可考虑时空分片。
 - **R-4 —— `num_heads % world_size` 约束**。14B=40 头,P∈{1,2,4,5,8,10,20,40};用户若要
   P=3 则需 1.3B(12 头)或 repad。文档需明示。
 - **R-5 —— 显存峰值**。720P×81f 即便 USP P=8,每 rank flash 的 `seq_full` 仍 ~38k,O(N²/P)
   attention 中间量在 head_dim=128、heads=5 时约 `5×38k²×128×4B ≈ 4.6GB`,需 4090 24GB 或
   A100。用 ring 或降分辨率兜底。
 - **R-6 —— T5/CLIP 依赖体积**。umt5-xxl ~10GB,需下载;v1 支持本地路径与镜像端点。
+- **R-7 —— NCCL 进程组端口冲突**。现有 `model_runner.py:29` 硬编码 `tcp://localhost:12345`
+  作为 `init_process_group` 的 `init_method`。`DiffusionEngine` 的 USP 组需要独立的端口
+  (如 `tcp://localhost:12346`),避免与 TP 组的 `all_reduce` 通信冲突。`usp/group.py` 的
+  `init_usp_group` 需接受端口参数或使用 `dist.new_group()` 创建子组。
+- **R-8 —— Context 单例的引擎隔离**。现有 `context.py` 是模块级全局变量。`DiffusionEngine`
+  和 `LLMEngine` 不应同时实例化(业务上也不会),但为安全起见,`DiffusionEngine` 应在 `__init__`
+  中检查是否已有 `LLMEngine` 实例,或在文档中明示互斥。
 
 ## 8. 启动命令与调用方式
 
@@ -306,7 +316,14 @@ engine = DiffusionEngine({**config, "model_name_or_path":"Wan-AI/Wan2.1-I2V-14B-
 video = engine.i2v(image="./assets/cat.jpg", prompt="the cat starts playing piano")
 ```
 
-## 9. 被否决的替代方案
+## 9. Context 单例隔离(R-8)
+
+现有 `context.py` 的 `_context` 是模块级全局变量,`LLMEngine` 和 `DiffusionEngine` 不应同时
+实例化。为安全起见:
+- `DiffusionEngine.__init__` 中检查 `_context.runner_type` 是否已被设置,若已有其他引擎占用则抛异常
+- 文档明示:`LLMEngine` 与 `DiffusionEngine` 在同一进程内互斥
+
+## 10. 被否决的替代方案
 
 - **直接用 diffusers `WanPipeline`**。否决:项目定位是自研 Triton 内核 + USP 栈;但可借
   diffusers 的 VAE/调度器作参考实现核对。

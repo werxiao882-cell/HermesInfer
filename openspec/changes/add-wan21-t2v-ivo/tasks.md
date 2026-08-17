@@ -8,16 +8,20 @@
 - [ ] 读 Wan2.1 官方 `wan/modules` 源码,核对 DiT block 精确结构:adaLN 调制方式、3D RoPE
       布局 vs timestep freq、cross-attn 用 umt5 还是 CLIP(R-1);回填 design §3.3、§3.4
 - [ ] 核对 checkpoint 权重名与 QKV 合并布局,确定 USP 按 head 切的维度(R-2)
-- [ ] `pyproject.toml` 新增 `diffusers`(参考)、`transformers`(T5/CLIP)、`imageio`、
+- [ ] `pyproject.toml` 新增 `diffusers`(VAE 复用)、`transformers`(T5/CLIP)、`imageio`、
       `torchvision`、`einops`;`uv sync`
 - [ ] `AGENTS.md` 增"Diffusion / USP"小节占位
 
+**里程碑 M1**:调研完成,DiT block 结构确认,依赖安装成功
+
 ## 2. USP 基础设施(`usp/`)
 
-- [ ] `usp/group.py`:`init_usp_group(world_size, rank)` 新建 NCCL 组(不与 TP 组共用)
+- [ ] `usp/group.py`:`init_usp_group(world_size, rank, port=12346)` 新建 NCCL 组(不与 TP 组共用,使用独立端口 R-7)
 - [ ] `usp/ulysses.py`:`all_to_all_seq2head` / `all_to_all_head2seq`,校验 `num_heads % P == 0`
 - [ ] `usp/usp_attention.py`:`USPAttention` forward:seq2head → flash(非因果)→ head2seq
 - [ ] `tests/test_usp.py`:往返保形保值;USP 与单卡等价(P=2,固定 seed)
+
+**里程碑 M2**:USP 基础设施完成,`test_usp.py` 全绿
 
 ## 3. 层扩展
 
@@ -37,10 +41,12 @@
 
 ## 5. VAE 与调度器(`diffusion/`)
 
-- [ ] `diffusion/vae.py`:`WanVAE` 3D 因果 encode/decode,空间 8×、时间 4×,16 通道
+- [ ] `diffusion/vae.py`:`WanVAE` 封装 diffusers `AutoencoderKLWan`,提供 `encode`/`decode` 接口;v1 不自研 3D 因果 VAE(R-3)
 - [ ] `diffusion/scheduler.py`:`FlowScheduler` rectified flow 1→0、shifted、可配步数
-- [ ] `tests/test_vae.py`:encode→decode 时空形状往返
+- [ ] `tests/test_vae.py`:encode→decode 时空形状往返(使用 diffusers VAE)
 - [ ] `tests/test_flow.py`:1→0 单调、shift 生效、自定义步数
+
+**里程碑 M3**:VAE 封装完成,FlowScheduler 测试通过
 
 ## 6. 文本/图像编码器与 pipeline(`diffusion/pipeline.py`)
 
@@ -51,9 +57,9 @@
 
 ## 7. 引擎与权重加载
 
-- [ ] `DiffusionEngine`:`t2v()` / `i2v()` 入口;`runner_type="diffusion"`
+- [ ] `DiffusionEngine`:`t2v()` / `i2v()` 入口;`runner_type="diffusion"`;`__init__` 检查 Context 单例隔离(R-8)
 - [ ] `utils/loader.py` Wan 分支:DiT 权重按 head 切到对应 rank(USP)、VAE/T5/CLIP 复制
-- [ ] VAE encode/decode 的多卡策略(v1:rank0 解码后 broadcast;R-3)
+- [ ] VAE encode/decode 的多卡策略:v1 rank0 跑 diffusers VAE 后 broadcast latent(R-3)
 
 ## 8. 长序列扩展(v2,可选)
 
@@ -72,6 +78,8 @@
 - [ ] 单卡 vs 8 卡输出 `1e-4` 一致(@gpu)
 - [ ] 显存峰值验证:720P×81f @ 8×4090 或 8×A100(R-5)
 - [ ] 现有 LLM/embedding 测试全绿(回归)
+
+**里程碑 M4**:数值对齐完成,端到端 pipeline 可跑,回归测试全绿
 
 ## 11. 收尾
 
