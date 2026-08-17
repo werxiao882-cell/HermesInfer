@@ -102,6 +102,37 @@ class ModelRunner:
                     normalize=pcfg.get('normalize', True),
                     mrl_dim=pcfg.get('mrl_dim', None),
                 )
+            case 'Qwen3-VL-2B-Instruct' | 'Qwen3-VL-8B-Instruct':
+                # 生成式 VL 模型:复用 Embedding 的 vision/decoder/deepstack,换 lm_head。
+                # runner_type 仍是 'generation'(走 KV cache / decode / cuda graph / 采样),
+                # 但 prefill 带多模态、用 MRoPE 位置 + 写 KV(图像 token 进 paged cache)。
+                from myvllm.models.qwen3_vl import Qwen3VLForCausalLM
+                self.is_vl_gen = True  # 生成式 VL:prefill 带 MRoPE+多模态+写 KV,decode 需 MRoPE 位置
+                self.model = Qwen3VLForCausalLM(
+                    vocab_size=config.get('vocab_size', 151936),
+                    hidden_size=config.get('hidden_size', 2048),
+                    num_heads=config.get('num_heads', 16),
+                    head_dim=config.get('head_dim', 128),
+                    num_kv_heads=config.get('num_kv_heads', 8),
+                    intermediate_size=config.get('intermediate_size', 6144),
+                    num_layers=config.get('num_layers', 28),
+                    rms_norm_epsilon=config.get('rms_norm_epsilon', 1e-6),
+                    base=config.get('base', 5_000_000),
+                    mrope_section=config.get('mrope_section', [24, 20, 20]),
+                    block_size=self.block_size,
+                    tie_word_embeddings=config.get('tie_word_embeddings', True),
+                    vision_depth=config.get('vision_depth', 24),
+                    vision_hidden_size=config.get('vision_hidden_size', 1024),
+                    vision_intermediate_size=config.get('vision_intermediate_size', 4096),
+                    vision_num_heads=config.get('vision_num_heads', 16),
+                    patch_size=config.get('patch_size', 16),
+                    temporal_patch_size=config.get('temporal_patch_size', 2),
+                    in_channels=config.get('in_channels', 3),
+                    out_hidden_size=config.get('out_hidden_size', 2048),
+                    spatial_merge_size=config.get('spatial_merge_size', 2),
+                    num_position_embeddings=config.get('num_position_embeddings', 2304),
+                    deepstack_visual_indexes=config.get('deepstack_visual_indexes', [5, 11, 17]),
+                )
             case _:
                 raise Exception(f"Unsupported model: {config['model_name_or_path']}")
 
@@ -402,7 +433,11 @@ class ModelRunner:
         if is_prefill or self.enforce_eager:
             # For varlen prefill, keep input_ids as 1D (concatenated tokens)
             # Do NOT unsqueeze - flash_attn_varlen_func expects 1D input with cu_seqlens
-            hidden_states = self.model(input_ids)
+            # 生成式 VL prefill:把多模态参数(pixel_values/grid_thw/image_token_spans)传给 model
+            if getattr(self, 'is_vl_gen', False) and is_prefill and hasattr(self, '_vl_gen_inputs'):
+                hidden_states = self.model(input_ids, **self._vl_gen_inputs)
+            else:
+                hidden_states = self.model(input_ids)
             logits = self.model.compute_logits(hidden_states)
         else:
             bs = input_ids.size(0)
@@ -434,6 +469,18 @@ class ModelRunner:
         # pooling 模式直接走 _run_pooling(无 decode、无采样、无 cuda graph)
         if self.runner_type == 'pooling':
             return self._run_pooling(seqs)
+        # 生成式 VL:prefill 带 MRoPE 位置 + 多模态 + 写 KV;decode 需 MRoPE 位置(新 token)
+        if getattr(self, 'is_vl_gen', False):
+            if is_prefill:
+                input_ids = self.prepare_prefill_vl_gen(seqs)
+            else:
+                input_ids = self.prepare_decode_vl(seqs)
+            logits = self.run_model(input_ids, is_prefill)
+            token_ids = None
+            if self.rank == 0:
+                token_ids = self.sampler(logits, self.prepare_sample(seqs))
+            reset_context()
+            return token_ids
         if is_prefill:
             input_ids = self.prepare_prefill(seqs)
         else:
@@ -562,6 +609,152 @@ class ModelRunner:
             "image_token_spans": image_token_spans,
             "cu_seqlens_q": cu_q,
         }
+
+    @torch.inference_mode()
+    def prepare_prefill_vl_gen(self, seqs: list[Sequence]) -> torch.Tensor:
+        """生成式 VL 的 prefill:复用 pooling 的多模态构造(vision tower + MRoPE 位置 +
+        scatter),但【写 KV cache】——图像 token 与文本 token 一样进 paged cache,供 decode
+        读回。runner_type='generation',slot_mapping 非 None 让 Attention.store_kvcache 生效。"""
+        from myvllm.models.qwen3_vl import compute_mrope_positions
+        # 1) 打包 input_ids + cu_seqlens_q,顺带收 mm_data
+        input_ids = []
+        cu_seqlens_q = [0]
+        per_seq_mm = []
+        per_seq_pos_inputs = []
+        sms = self.config.get('spatial_merge_size', 2)
+        for seq in seqs:
+            ids = seq.token_ids
+            input_ids.extend(ids)
+            cu_seqlens_q.append(cu_seqlens_q[-1] + len(ids))
+            mm = getattr(seq, "mm_data", None)
+            per_seq_mm.append(mm)
+            if mm is not None and mm.token_types is not None:
+                per_seq_pos_inputs.append({
+                    "input_ids": torch.tensor(ids, device='cpu', dtype=torch.long),
+                    "token_types": mm.token_types.to('cpu'),
+                    "image_grids": [tuple(int(x) for x in g) for g in mm.grid_thw.tolist()] if mm.grid_thw is not None else [],
+                })
+            else:
+                per_seq_pos_inputs.append({
+                    "input_ids": torch.tensor(ids, device='cpu', dtype=torch.long),
+                    "token_types": torch.zeros(len(ids), dtype=torch.int),
+                    "image_grids": [],
+                })
+
+        # 2) MRoPE 3D 位置(VL 模型始终用 MRoPE,纯文本也 T=H=W=arange)
+        positions_3d = compute_mrope_positions(per_seq_pos_inputs, spatial_merge_size=sms)
+        positions_3d = positions_3d.cuda(self.rank)
+
+        # 3) 视觉输入(批级拼 pixel_values/grid_thw,spans 加偏移)
+        pixel_values = None
+        grid_thw = None
+        image_token_spans = []
+        has_image = any(m is not None and m.has_image for m in per_seq_mm)
+        if has_image:
+            pv_list, gt_list = [], []
+            offset = 0
+            for seq, mm in zip(seqs, per_seq_mm):
+                ids_len = len(seq.token_ids)
+                if mm is not None and mm.has_image:
+                    pv_list.append(mm.pixel_values)
+                    gt_list.append(mm.grid_thw)
+                    for (s, e) in mm.image_token_spans:
+                        image_token_spans.append((offset + s, offset + e))
+                offset += ids_len
+            pixel_values = torch.cat(pv_list, dim=0).cuda(self.rank)
+            grid_thw = torch.cat(gt_list, dim=0).cuda(self.rank)
+
+        # 4) 【写 KV】block_manager.allocate → block_table + slot_mapping(图像 token 占 KV slot)
+        slot_mappings = []
+        block_tables = []
+        cu_seqlens_k = [0]
+        for seq in seqs:
+            # 生成式必须 allocate(Embedding 跳过);此处沿用文本 prepare_prefill 的 slot 逻辑
+            if not seq.block_table:
+                self.block_manager.allocate(seq)  # 由 scheduler 已 allocate;若未则补
+            num_cached = seq.num_cached_tokens
+            seqlens_k_i = len(seq.token_ids)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlens_k_i)
+            for i, block_id in enumerate(seq.block_table[num_cached // self.block_size:]):
+                if num_cached // self.block_size + i != seq.num_blocks - 1:
+                    slot_mappings.extend(range(block_id * self.block_size, (block_id + 1) * self.block_size))
+                else:
+                    slot_mappings.extend(range(block_id * self.block_size, block_id * self.block_size + seq.last_block_num_tokens))
+        if len(seqs) > 1 or seqs[0].block_table:
+            all_bt = [seq.block_table for seq in seqs]
+            max_nblk = max((len(bt) for bt in all_bt if bt), default=0)
+            for seq in seqs:
+                bt = seq.block_table + [-1] * (max_nblk - len(seq.block_table))
+                block_tables.append(bt)
+
+        # 5) image_token_mask(deepstack scatter 用;生成式 prefill 同样注入 deepstack)
+        total = len(input_ids)
+        if image_token_spans:
+            mask = torch.zeros(total, dtype=torch.bool)
+            for (s, e) in image_token_spans:
+                mask[s:e] = True
+            image_token_mask = mask.cuda(self.rank)
+        else:
+            image_token_mask = None
+
+        cu_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping_t = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True) if slot_mappings else None
+        set_context(
+            is_prefill=True,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            max_seqlen_q=max(cu_seqlens_q[i+1]-cu_seqlens_q[i] for i in range(len(cu_seqlens_q)-1)),
+            max_seqlen_k=max(cu_seqlens_k[i+1]-cu_seqlens_k[i] for i in range(len(cu_seqlens_k)-1)),
+            slot_mapping=slot_mapping_t,  # 非 None → Attention 写 KV
+            context_lens=None,
+            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            positions_3d=positions_3d,
+            image_token_mask=image_token_mask,
+            runner_type='generation',
+        )
+        # 把多模态参数挂实例上,run_model → model.forward 取用
+        self._vl_gen_inputs = {"pixel_values": pixel_values, "grid_thw": grid_thw,
+                               "image_token_spans": image_token_spans}
+        return torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+
+    @torch.inference_mode()
+    def prepare_decode_vl(self, seqs: list[Sequence]) -> torch.Tensor:
+        """生成式 VL 的 decode:每序列喂 last_token,paged attention 从 cache 读 K/V。
+        与纯文本 prepare_decode 的唯一区别:需给新 token 设 MRoPE 位置 positions_3d
+        (文本 token 三轴 = 该 token 的绝对位置 L,L,L;transformers 用 rope_deltas 调整,
+        此处近似为 L,自洽可跑,严格数值对齐需 GPU 核对)。"""
+        input_ids = []
+        context_lens = []
+        slot_mappings = []
+        block_tables = []
+        pos3d = []  # 每序列新 token 的 (T,H,W)
+        for seq in seqs:
+            input_ids.append(seq.last_token)
+            context_lens.append(len(seq))
+            slot_mappings.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+            L = len(seq)  # 绝对位置(prompt + 已生成)
+            pos3d.append([L, L, L])
+        all_bt = [seq.block_table for seq in seqs]
+        max_nblk = max(len(bt) for bt in all_bt)
+        for seq in seqs:
+            block_tables.append(seq.block_table + [-1] * (max_nblk - len(seq.block_table)))
+        # positions_3d:(3, num_seqs) — 每列是一个新 token 的 (T,H,W)
+        pos3d_t = torch.tensor(pos3d, dtype=torch.long, pin_memory=True).t().cuda(non_blocking=True)
+        input_ids_t = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        set_context(
+            is_prefill=False,
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            max_seqlen_q=0,
+            max_seqlen_k=0,
+            slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            positions_3d=pos3d_t,
+            image_token_mask=None,
+            runner_type='generation',
+        )
+        return input_ids_t
 
     # capture the CUDA graph:
     # pre-allocation at maximum sizes: allocated onece and reuse for all graphs
