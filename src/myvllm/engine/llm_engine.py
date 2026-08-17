@@ -41,10 +41,12 @@ class LLMEngine:
         self.runner_type = config.get("runner_type", "generation")
         self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"))
         # VL/pooling 路径用 AutoProcessor(chat template + <|image_pad|> 插入 + 像素抽取)
+        # pooling(embedding)与生成式 VL(Qwen3-VL-*-Instruct)都需要 processor
         self.processor = None
-        if self.runner_type == "pooling":
+        mname = config.get("model_name_or_path", "")
+        if self.runner_type == "pooling" or "Qwen3-VL" in mname or "VL" in mname:
             from transformers import AutoProcessor
-            self.processor = AutoProcessor.from_pretrained(config.get("model_name_or_path"))
+            self.processor = AutoProcessor.from_pretrained(mname)
 
         # scheduler 需在 model_runner 之后初始化:world_size>1 时 ModelRunner.__init__
         # 调 dist.init_process_group() 这是个 collective barrier —— rank-0 会阻塞到所有
@@ -120,6 +122,27 @@ class LLMEngine:
         generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]
         output = {'text': [self.tokenizer.decode(tokens) for tokens in generated_tokens], 'token_ids': generated_tokens}
         return output
+
+    # ---- 生成式 VL chat(文/图 → 文本自回归)----
+    # 经 AutoProcessor 把 {"text","image"} 转成带 mm_data 的 Sequence 入队,再走 step() 循环
+    # 到完成(连续批 prefill+decode),decode 出 token → tokenizer.decode → 文本。
+    def chat(self, inputs: list[dict], sampling_params: SamplingParams) -> dict:
+        if not getattr(self.model_runner, 'is_vl_gen', False):
+            raise RuntimeError("chat() requires a Qwen3-VL-*-Instruct model (is_vl_gen)")
+        for item in inputs:
+            self._add_input(item, "Describe the image and answer the user's question.", Sequence.counter)
+            # 给最近入队的序列设采样参数(chat 用 SamplingParams 的 temperature/max_tokens/eos)
+            seq = self.scheduler.waiting[-1]
+            seq.temperature = sampling_params.temperature
+            seq.max_tokens = sampling_params.max_tokens
+            seq.ignore_eos = sampling_params.ignore_eos
+            seq.max_model_length = sampling_params.max_model_length
+        generated_tokens = {}
+        while not self.scheduler.is_finished():
+            outputs, num_processed_tokens, is_prefill = self.step()
+            generated_tokens.update({seq_id: tokens for seq_id, tokens in outputs})
+        generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]
+        return {'text': [self.tokenizer.decode(tokens) for tokens in generated_tokens], 'token_ids': generated_tokens}
 
     # ---- pooling / embedding path (VL) ----
 
