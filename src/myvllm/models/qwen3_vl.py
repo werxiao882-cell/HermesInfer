@@ -459,7 +459,9 @@ class Qwen3VLForEmbedding(nn.Module):
         self.norm = LayerNorm(torch.ones(hidden_size))
         self.head = EmbeddingHead(pooling_mode, normalize, mrl_dim)
 
-    def forward(self, input_ids, pixel_values=None, grid_thw=None, image_token_spans=None, cu_seqlens_q=None):
+    def _forward_hidden(self, input_ids, pixel_values=None, grid_thw=None, image_token_spans=None):
+        """跑到最终 RMSNorm 后的 hidden states(未过 head)。EmbeddingHead 与 lm_head
+        共用此方法:Embedding 路径再 pooling,生成式路径再 lm_head。"""
         # input_ids:(total_tokens,) packed varlen;positions_3d 由 ModelRunner 经 context 传入
         pos3d = get_context().positions_3d
         x = self.embed_tokens(input_ids)
@@ -483,10 +485,56 @@ class Qwen3VLForEmbedding(nn.Module):
                 # transformers _deepstack_process:hidden[visual_pos_masks] += visual_embeds
                 x = x.clone(); x[img_idx] = x[img_idx] + deepstack[li].to(x.dtype)
         x, _ = self.norm(x, residual)
+        return x
+
+    def forward(self, input_ids, pixel_values=None, grid_thw=None, image_token_spans=None, cu_seqlens_q=None):
+        # Embedding 路径:_forward_hidden → EmbeddingHead(last-token + L2 + MRL)
+        x = self._forward_hidden(input_ids, pixel_values, grid_thw, image_token_spans)
         if cu_seqlens_q is None:
             cu_seqlens_q = torch.tensor([0, x.shape[0]], device=x.device, dtype=torch.long)
         # EmbeddingHead:last-token gather + L2(+MRL),复制,每 rank 相同
         return self.head(x, cu_seqlens_q)
+
+
+# 生成式 VL 模型:复用 Embedding 的 vision/decoder/deepstack,把 EmbeddingHead 换成
+# lm_head,forward 返回 hidden(供 run_model → compute_logits → 采样)。
+# prefill 写 KV(图像 token 的 K/V 进 paged cache);decode 与纯文本一致(图像 token 的
+# K/V 已在 cache,paged attention 读回)。MRoPE 位置对 decode 的新 token 取 (L,L,L) 近似
+# (transformers 用 rope_deltas 调整,见 R-4;此处自洽可跑,严格数值对齐需 GPU 核对)。
+class Qwen3VLForCausalLM(Qwen3VLForEmbedding):
+    def __init__(self, vocab_size=151936, hidden_size=2048, num_heads=16, head_dim=128,
+                 num_kv_heads=8, intermediate_size=6144, num_layers=28, rms_norm_epsilon=1e-6,
+                 base=5_000_000, mrope_section=None, block_size=256, tie_word_embeddings=True,
+                 vision_depth=24, vision_hidden_size=1024, vision_intermediate_size=4096,
+                 vision_num_heads=16, patch_size=16, temporal_patch_size=2, in_channels=3,
+                 out_hidden_size=2048, spatial_merge_size=2, num_position_embeddings=2304,
+                 deepstack_visual_indexes=None):
+        super().__init__(
+            vocab_size=vocab_size, hidden_size=hidden_size, num_heads=num_heads, head_dim=head_dim,
+            num_kv_heads=num_kv_heads, intermediate_size=intermediate_size, num_layers=num_layers,
+            rms_norm_epsilon=rms_norm_epsilon, base=base, mrope_section=mrope_section,
+            block_size=block_size, tie_word_embeddings=tie_word_embeddings,
+            vision_depth=vision_depth, vision_hidden_size=vision_hidden_size,
+            vision_intermediate_size=vision_intermediate_size, vision_num_heads=vision_num_heads,
+            patch_size=patch_size, temporal_patch_size=temporal_patch_size, in_channels=in_channels,
+            out_hidden_size=out_hidden_size, spatial_merge_size=spatial_merge_size,
+            num_position_embeddings=num_position_embeddings,
+            deepstack_visual_indexes=deepstack_visual_indexes,
+            # EmbeddingHead 参数对生成式无意义,给默认即可(会被删除/替换)
+            pooling_mode="last_token", normalize=True, mrl_dim=None)
+        # 用 lm_head 替换 EmbeddingHead(词表 TP 分片 + gather 到 rank 0 采样,对标 qwen3.py)
+        from myvllm.layers import ParallelLMHead
+        self.lm_head = ParallelLMHead(num_embeddings=vocab_size, embedding_dim=hidden_size)
+        if tie_word_embeddings:
+            self.lm_head.weight = self.embed_tokens.weight
+        del self.head  # 生成式不用 pooling head
+
+    def forward(self, input_ids, pixel_values=None, grid_thw=None, image_token_spans=None, cu_seqlens_q=None):
+        # 生成式:返回 hidden(未过 lm_head),由 ModelRunner.run_model 调 compute_logits
+        return self._forward_hidden(input_ids, pixel_values, grid_thw, image_token_spans)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(hidden_states)
 
 
 if __name__ == "__main__":
